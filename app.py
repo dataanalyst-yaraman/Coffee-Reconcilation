@@ -40,8 +40,8 @@ if app_mode == "Inventory vs Production":
 
     # --- Preprocessing ---
     # Convert dates
-    inventory_df['Date'] = pd.to_datetime(inventory_df['Date'], format='%m/%d/%Y', errors='coerce')
-    production_df['Date'] = pd.to_datetime(production_df['Date'], format='%m/%d/%Y', errors='coerce')
+    inventory_df['Date'] = pd.to_datetime(inventory_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
+    production_df['Date'] = pd.to_datetime(production_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
 
     # Drop rows with invalid dates
     inventory_df = inventory_df.dropna(subset=['Date'])
@@ -74,11 +74,7 @@ if app_mode == "Inventory vs Production":
     start_date = st.sidebar.date_input("Start Date", min_date, key="inv_start_date")
     end_date = st.sidebar.date_input("End Date", max_date, key="inv_end_date")
 
-    # Convert inputs to datetime for comparison
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
-
-    # Filter Data by Date
+    # Filter Data by Date (both are date objects now)
     inv_filtered = inventory_df[(inventory_df['Date'] >= start_date) & (inventory_df['Date'] <= end_date)]
     prod_filtered = production_df[(production_df['Date'] >= start_date) & (production_df['Date'] <= end_date)]
 
@@ -114,9 +110,35 @@ if app_mode == "Inventory vs Production":
         merged_gb = merged_gb.round(2)
         
         # Display Merged Data
-        # Display Merged Data
         st.subheader("Detailed Comparison")
-        st.dataframe(merged_gb.style.format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), use_container_width=True)
+        
+        # Apply red text to mismatched or null values
+        def highlight_detailed_mismatch(row):
+            colors = [''] * len(row)
+            inv_val = row['Inventory']
+            prod_val = row['Production']
+            
+            # Find column indices
+            inv_idx = row.index.get_loc('Inventory')
+            prod_idx = row.index.get_loc('Production')
+            
+            # Check if values don't match or if either is null
+            if pd.isna(inv_val) or pd.isna(prod_val):
+                colors[inv_idx] = 'color: #ff0000'
+                colors[prod_idx] = 'color: #ff0000'
+            elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
+                if abs(inv_val - prod_val) > 0.01:
+                    colors[inv_idx] = 'color: #ff0000'
+                    colors[prod_idx] = 'color: #ff0000'
+            
+            return colors
+        
+        st.dataframe(
+            merged_gb.style
+            .apply(highlight_detailed_mismatch, axis=1)
+            .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), 
+            use_container_width=True
+        )
         
         # Totals
         col1, col2 = st.columns(2)
@@ -144,13 +166,10 @@ if app_mode == "Inventory vs Production":
         ).fillna(0)
         
         validation_gb['Difference'] = (validation_gb['Inventory'] - validation_gb['Production']).abs()
-        validation_gb['Match'] = validation_gb['Difference'].abs() < 0.01 # Tolerance
         validation_gb = validation_gb.round(2)
         
-        # Apply color and format
         st.dataframe(
             validation_gb.style
-            .apply(lambda x: ['background-color: #d4edda' if v else 'background-color: #f8d7da' for v in x], subset=['Match'])
             .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}), 
             use_container_width=True
         )
@@ -184,9 +203,35 @@ if app_mode == "Inventory vs Production":
         merged_rb = merged_rb.round(2)
         
         # Display Merged Data
-        # Display Merged Data
         st.subheader("Detailed Comparison")
-        st.dataframe(merged_rb.style.format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), use_container_width=True)
+        
+        # Apply red text to mismatched or null values
+        def highlight_detailed_mismatch(row):
+            colors = [''] * len(row)
+            inv_val = row['Inventory']
+            prod_val = row['Production']
+            
+            # Find column indices
+            inv_idx = row.index.get_loc('Inventory')
+            prod_idx = row.index.get_loc('Production')
+            
+            # Check if values don't match or if either is null
+            if pd.isna(inv_val) or pd.isna(prod_val):
+                colors[inv_idx] = 'color: #ff0000'
+                colors[prod_idx] = 'color: #ff0000'
+            elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
+                if abs(inv_val - prod_val) > 0.01:
+                    colors[inv_idx] = 'color: #ff0000'
+                    colors[prod_idx] = 'color: #ff0000'
+            
+            return colors
+        
+        st.dataframe(
+            merged_rb.style
+            .apply(highlight_detailed_mismatch, axis=1)
+            .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), 
+            use_container_width=True
+        )
         
         # Totals
         col1, col2 = st.columns(2)
@@ -213,12 +258,10 @@ if app_mode == "Inventory vs Production":
         ).fillna(0)
         
         validation_rb['Difference'] = (validation_rb['Inventory'] - validation_rb['Production']).abs()
-        validation_rb['Match'] = validation_rb['Difference'].abs() < 0.01
         validation_rb = validation_rb.round(2)
         
         st.dataframe(
             validation_rb.style
-            .apply(lambda x: ['background-color: #d4edda' if v else 'background-color: #f8d7da' for v in x], subset=['Match'])
             .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}), 
             use_container_width=True
         )
@@ -252,9 +295,35 @@ if app_mode == "Inventory vs Production":
         merged_lm = merged_lm.round(2)
         
         # Display Merged Data
-        # Display Merged Data
         st.subheader("Detailed Comparison")
-        st.dataframe(merged_lm.style.format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), use_container_width=True)
+        
+        # Apply red text to mismatched or null values
+        def highlight_detailed_mismatch(row):
+            colors = [''] * len(row)
+            inv_val = row['Inventory']
+            prod_val = row['Production']
+            
+            # Find column indices
+            inv_idx = row.index.get_loc('Inventory')
+            prod_idx = row.index.get_loc('Production')
+            
+            # Check if values don't match or if either is null
+            if pd.isna(inv_val) or pd.isna(prod_val):
+                colors[inv_idx] = 'color: #ff0000'
+                colors[prod_idx] = 'color: #ff0000'
+            elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
+                if abs(inv_val - prod_val) > 0.01:
+                    colors[inv_idx] = 'color: #ff0000'
+                    colors[prod_idx] = 'color: #ff0000'
+            
+            return colors
+        
+        st.dataframe(
+            merged_lm.style
+            .apply(highlight_detailed_mismatch, axis=1)
+            .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), 
+            use_container_width=True
+        )
         
         # Totals
         col1, col2 = st.columns(2)
@@ -281,12 +350,10 @@ if app_mode == "Inventory vs Production":
         ).fillna(0)
         
         validation_lm['Difference'] = (validation_lm['Inventory'] - validation_lm['Production']).abs()
-        validation_lm['Match'] = validation_lm['Difference'].abs() < 0.01
         validation_lm = validation_lm.round(2)
         
         st.dataframe(
             validation_lm.style
-            .apply(lambda x: ['background-color: #d4edda' if v else 'background-color: #f8d7da' for v in x], subset=['Match'])
             .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}), 
             use_container_width=True
         )
@@ -329,8 +396,17 @@ elif app_mode == "Dispatch vs Full Tracker":
 
     # --- Preprocessing ---
     # Convert dates
-    dispatch_orders['Date'] = pd.to_datetime(dispatch_orders['Date'], format='%m/%d/%Y', errors='coerce')
-    fulltracker_orders['Dispatch Date'] = pd.to_datetime(fulltracker_orders['Dispatch Date'], format='%m/%d/%Y', errors='coerce')
+    dispatch_orders['Date'] = pd.to_datetime(dispatch_orders['Date'], format='%m/%d/%Y', errors='coerce').dt.date
+    fulltracker_orders['Dispatch Date'] = pd.to_datetime(fulltracker_orders['Dispatch Date'], format='%m/%d/%Y', errors='coerce').dt.date
+
+    # Clean and convert Invoice Amount columns - remove rupee symbol and convert to float
+    if 'Invoice Amount' in dispatch_orders.columns:
+        dispatch_orders['Invoice Amount'] = dispatch_orders['Invoice Amount'].astype(str).str.replace('₹', '').str.replace(',', '').str.strip()
+        dispatch_orders['Invoice Amount'] = pd.to_numeric(dispatch_orders['Invoice Amount'], errors='coerce').round(2)
+    
+    if 'Invoice Amount' in fulltracker_orders.columns:
+        fulltracker_orders['Invoice Amount'] = fulltracker_orders['Invoice Amount'].astype(str).str.replace('₹', '').str.replace(',', '').str.strip()
+        fulltracker_orders['Invoice Amount'] = pd.to_numeric(fulltracker_orders['Invoice Amount'], errors='coerce').round(2)
 
     # Drop rows with invalid dates in critical columns if necessary, or handle as NaT
     # For now, we keep them but filtering might exclude them automatically
@@ -342,28 +418,20 @@ elif app_mode == "Dispatch vs Full Tracker":
     st.sidebar.markdown("<br>" * 10, unsafe_allow_html=True)
     
     # Calculate min/max dates
-    min_date_disp = dispatch_orders['Date'].min()
-    max_date_disp = dispatch_orders['Date'].max()
-    min_date_ft = fulltracker_orders['Dispatch Date'].dropna().min()
-    max_date_ft = fulltracker_orders['Dispatch Date'].dropna().max()
+    # Drop NaN values before min/max to avoid comparison errors
+    dispatch_dates = dispatch_orders['Date'].dropna()
+    fulltracker_dates = fulltracker_orders['Dispatch Date'].dropna()
     
-    # Handle NaTs if any
-    if pd.isna(min_date_disp): min_date_disp = pd.Timestamp.now()
-    if pd.isna(max_date_disp): max_date_disp = pd.Timestamp.now()
-    if pd.isna(min_date_ft): min_date_ft = pd.Timestamp.now()
-    if pd.isna(max_date_ft): max_date_ft = pd.Timestamp.now()
+    min_date_disp = dispatch_dates.min() if len(dispatch_dates) > 0 else datetime.date.today()
+    max_date_disp = dispatch_dates.max() if len(dispatch_dates) > 0 else datetime.date.today()
+    min_date_ft = fulltracker_dates.min() if len(fulltracker_dates) > 0 else datetime.date.today()
+    max_date_ft = fulltracker_dates.max() if len(fulltracker_dates) > 0 else datetime.date.today()
 
     min_date = min(min_date_disp, min_date_ft)
     max_date = max(max_date_disp, max_date_ft)
 
-    if isinstance(min_date, pd.Timestamp): min_date = min_date.date()
-    if isinstance(max_date, pd.Timestamp): max_date = max_date.date()
-
     start_date = st.sidebar.date_input("Start Date", min_date, key="disp_start_date")
     end_date = st.sidebar.date_input("End Date", max_date, key="disp_end_date")
-
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
     
     # --- Filtering and Merging ---
     
@@ -442,6 +510,15 @@ elif app_mode == "Dispatch vs Full Tracker":
     
     final_df = final_df.rename(columns=rename_map)
     
+    # Convert numeric columns to float to ensure proper formatting
+    numeric_columns = ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount', 
+                       'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)',
+                       'Fulltracker Packets Qty', 'Dispatch Packets Qty']
+    
+    for col in numeric_columns:
+        if col in final_df.columns:
+            final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
+    
     # --- Display ---
     st.subheader("Reconciliation Table")
     
@@ -457,10 +534,84 @@ elif app_mode == "Dispatch vs Full Tracker":
     )
     
     if selected_columns:
-        # Check if user wants wrapping (User asked "Add warp for cells")
-        # Apply wrapping via Pandas Styler
+        # Apply red text to mismatched values between FullTracker and Dispatch columns
+        def highlight_reconciliation_mismatch(row):
+            colors = [''] * len(row)
+            
+            # Get column names that exist in the row
+            cols = row.index.tolist()
+            
+            # Check Invoice Number mismatch
+            if 'Fulltracker Invoice Number' in cols and 'Dispatch Invoice Number' in cols:
+                ft_inv = row['Fulltracker Invoice Number']
+                d_inv = row['Dispatch Invoice Number']
+                if pd.isna(ft_inv) or pd.isna(d_inv) or ft_inv != d_inv:
+                    colors[cols.index('Fulltracker Invoice Number')] = 'color: #ff0000'
+                    colors[cols.index('Dispatch Invoice Number')] = 'color: #ff0000'
+            
+            # Check Invoice Amount mismatch
+            if 'Fulltracker Invoice Amount' in cols and 'Dispatch Invoice Amount' in cols:
+                ft_amt = row['Fulltracker Invoice Amount']
+                d_amt = row['Dispatch Invoice Amount']
+                # Check for NaN first, then compare
+                if pd.isna(ft_amt) or pd.isna(d_amt):
+                    colors[cols.index('Fulltracker Invoice Amount')] = 'color: #ff0000'
+                    colors[cols.index('Dispatch Invoice Amount')] = 'color: #ff0000'
+                elif isinstance(ft_amt, (int, float)) and isinstance(d_amt, (int, float)):
+                    if abs(ft_amt - d_amt) > 0.01:
+                        colors[cols.index('Fulltracker Invoice Amount')] = 'color: #ff0000'
+                        colors[cols.index('Dispatch Invoice Amount')] = 'color: #ff0000'
+            
+            # Check Total Qty mismatch
+            if 'Fulltracker Total Qty (Kg)' in cols and 'Dispatch Total Qty (Kg)' in cols:
+                ft_qty = row['Fulltracker Total Qty (Kg)']
+                d_qty = row['Dispatch Total Qty (Kg)']
+                # Check for NaN first, then compare
+                if pd.isna(ft_qty) or pd.isna(d_qty):
+                    colors[cols.index('Fulltracker Total Qty (Kg)')] = 'color: #ff0000'
+                    colors[cols.index('Dispatch Total Qty (Kg)')] = 'color: #ff0000'
+                elif isinstance(ft_qty, (int, float)) and isinstance(d_qty, (int, float)):
+                    if abs(ft_qty - d_qty) > 0.01:
+                        colors[cols.index('Fulltracker Total Qty (Kg)')] = 'color: #ff0000'
+                        colors[cols.index('Dispatch Total Qty (Kg)')] = 'color: #ff0000'
+            
+            # Check SKU mismatch
+            if 'Fulltracker SKU' in cols and 'Dispatch SKU' in cols:
+                ft_sku = row['Fulltracker SKU']
+                d_sku = row['Dispatch SKU']
+                if pd.isna(ft_sku) or pd.isna(d_sku) or ft_sku != d_sku:
+                    colors[cols.index('Fulltracker SKU')] = 'color: #ff0000'
+                    colors[cols.index('Dispatch SKU')] = 'color: #ff0000'
+            
+            # Check Packets Qty mismatch
+            if 'Fulltracker Packets Qty' in cols and 'Dispatch Packets Qty' in cols:
+                ft_pkt = row['Fulltracker Packets Qty']
+                d_pkt = row['Dispatch Packets Qty']
+                # Check for NaN first, then compare
+                if pd.isna(ft_pkt) or pd.isna(d_pkt):
+                    colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
+                    colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
+                elif isinstance(ft_pkt, (int, float)) and isinstance(d_pkt, (int, float)):
+                    if abs(ft_pkt - d_pkt) > 0.01:
+                        colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
+                        colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
+            
+            return colors
+        
+        # Create format dictionary for numeric columns that exist and are numeric
+        format_dict = {}
+        for col in selected_columns:
+            if col in ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount', 
+                       'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)',
+                       'Fulltracker Packets Qty', 'Dispatch Packets Qty']:
+                if col in final_df.columns and pd.api.types.is_numeric_dtype(final_df[col]):
+                    format_dict[col] = '{:.2f}'
+        
         st.dataframe(
-            final_df[selected_columns].style.set_properties(**{'white-space': 'pre-wrap'}), 
+            final_df[selected_columns].style
+            .apply(highlight_reconciliation_mismatch, axis=1)
+            .format(format_dict, na_rep='')
+            .set_properties(**{'white-space': 'pre-wrap'}), 
             use_container_width=True
         )
     else:
@@ -468,7 +619,7 @@ elif app_mode == "Dispatch vs Full Tracker":
 
     # --- SKU Totals Comparison ---
     st.divider()
-    st.subheader("SKU Totals Side-by-Side Validation")
+    st.subheader("SKU Totals Variance")
     
     # 1. Get List of PO UIDs from the filtered orders
     # We should filter items based on the filtered orders to ensure consistency
@@ -491,19 +642,87 @@ elif app_mode == "Dispatch vs Full Tracker":
         suffixes=('_FullTracker', '_Dispatch')
     ).fillna(0)
     
-    # 5. Calculate Variance (Absolute)
-    sku_merge['Quantity Variance'] = (sku_merge['Quantity_FullTracker'] - sku_merge['Quantity_Dispatch']).abs()
-    sku_merge['Total Kg Variance'] = (sku_merge['Total Kg_FullTracker'] - sku_merge['Total Kg_Dispatch']).abs()
+    # Rename columns for better readability
+    sku_merge = sku_merge.rename(columns={
+        'Quantity_FullTracker': 'FullTracker Quantity',
+        'Total Kg_FullTracker': 'FullTracker Total Kg',
+        'Quantity_Dispatch': 'Dispatch Quantity',
+        'Total Kg_Dispatch': 'Dispatch Total Kg'
+    })
     
-    # 6. Format and Display
+    # Convert to numeric to avoid string arithmetic errors
+    sku_merge['FullTracker Quantity'] = pd.to_numeric(sku_merge['FullTracker Quantity'], errors='coerce').fillna(0)
+    sku_merge['FullTracker Total Kg'] = pd.to_numeric(sku_merge['FullTracker Total Kg'], errors='coerce').fillna(0)
+    sku_merge['Dispatch Quantity'] = pd.to_numeric(sku_merge['Dispatch Quantity'], errors='coerce').fillna(0)
+    sku_merge['Dispatch Total Kg'] = pd.to_numeric(sku_merge['Dispatch Total Kg'], errors='coerce').fillna(0)
+    
+    # 5. Calculate Variance (Absolute)
+    sku_merge['Quantity Variance'] = (sku_merge['FullTracker Quantity'] - sku_merge['Dispatch Quantity']).abs()
+    sku_merge['Total Kg Variance'] = (sku_merge['FullTracker Total Kg'] - sku_merge['Dispatch Total Kg']).abs()
+    
+    # 6. Format and Display with red text for mismatches
+    def highlight_sku_mismatch(row):
+        colors = [''] * len(row)
+        
+        # Get column indices
+        cols = row.index.tolist()
+        
+        # Highlight Quantity columns if variance > 0.01
+        if row['Quantity Variance'] > 0.01:
+            colors[cols.index('FullTracker Quantity')] = 'color: #ff0000'
+            colors[cols.index('Dispatch Quantity')] = 'color: #ff0000'
+            colors[cols.index('Quantity Variance')] = 'color: #ff0000'
+        
+        # Highlight Total Kg columns if variance > 0.01
+        if row['Total Kg Variance'] > 0.01:
+            colors[cols.index('FullTracker Total Kg')] = 'color: #ff0000'
+            colors[cols.index('Dispatch Total Kg')] = 'color: #ff0000'
+            colors[cols.index('Total Kg Variance')] = 'color: #ff0000'
+        
+        return colors
+    
     st.dataframe(
-        sku_merge.style.format({
-            "Quantity_FullTracker": "{:.2f}",
-            "Total Kg_FullTracker": "{:.2f}",
-            "Quantity_Dispatch": "{:.2f}",
-            "Total Kg_Dispatch": "{:.2f}",
+        sku_merge.style
+        .apply(highlight_sku_mismatch, axis=1)
+        .format({
+            "FullTracker Quantity": "{:.2f}",
+            "FullTracker Total Kg": "{:.2f}",
+            "Dispatch Quantity": "{:.2f}",
+            "Dispatch Total Kg": "{:.2f}",
             "Quantity Variance": "{:.2f}",
             "Total Kg Variance": "{:.2f}"
         }),
+        use_container_width=True
+    )
+    
+    # --- Invoice Amount Totals Validation ---
+    st.divider()
+    st.subheader("Invoice Amount Totals Variance")
+    
+    # Calculate total invoice amounts from filtered orders
+    # Convert to numeric first to avoid string concatenation errors
+    ft_total_invoice = pd.to_numeric(fulltracker_orders_filtered['Invoice Amount'], errors='coerce').fillna(0).sum()
+    disp_total_invoice = pd.to_numeric(dispatch_orders_filtered['Invoice Amount'], errors='coerce').fillna(0).sum()
+    invoice_variance = abs(ft_total_invoice - disp_total_invoice)
+    
+    # Create comparison dataframe
+    invoice_comparison = pd.DataFrame({
+        'Source': ['FullTracker', 'Dispatch', 'Variance'],
+        'Total Invoice Amount': [ft_total_invoice, disp_total_invoice, invoice_variance]
+    })
+    
+    # Apply red text if there's a variance
+    def highlight_invoice_variance(row):
+        colors = [''] * len(row)
+        if row['Source'] == 'Variance' and row['Total Invoice Amount'] > 0.01:
+            colors[1] = 'color: #ff0000'  # Highlight the amount column
+        elif row['Source'] in ['FullTracker', 'Dispatch'] and invoice_variance > 0.01:
+            colors[1] = 'color: #ff0000'  # Highlight both source amounts if variance exists
+        return colors
+    
+    st.dataframe(
+        invoice_comparison.style
+        .apply(highlight_invoice_variance, axis=1)
+        .format({"Total Invoice Amount": "{:.2f}"}),
         use_container_width=True
     )
