@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import datetime
+from collections import Counter
 
 # Page Config
 st.set_page_config(page_title="Inventory vs Production", layout="wide")
@@ -444,12 +445,11 @@ elif app_mode == "Dispatch vs Full Tracker":
     # Filter Full Tracker Orders by Date and PO UID 'YT'
     fulltracker_orders_filtered = fulltracker_orders[
         (fulltracker_orders['Dispatch Date'] >= start_date) & 
-        (fulltracker_orders['Dispatch Date'] <= end_date) & 
+        (fulltracker_orders['Dispatch Date'] <= end_date) &
         (fulltracker_orders['PO UID'].str.startswith('YT', na=False))
     ]
     
-    # Merge on PO UID
-    # suffixes=('_fulltracker', '_dispatch')
+    # Merge on PO UID (one row per order)
     merged_df = fulltracker_orders_filtered.merge(
         dispatch_orders_filtered, 
         on='PO UID', 
@@ -457,63 +457,30 @@ elif app_mode == "Dispatch vs Full Tracker":
         suffixes=('_fulltracker', '_dispatch')
     )
     
-    # Rename columns that might have collided but didn't get suffixes if they weren't in both or handled differently
-    # The user specifically requested these output columns:
-    # ['PO UID', 'Dispatch Date', 'Invoice Number_fulltracker', 'Invoice Amount_fulltracker', 'Total Qty (Kg)', 'SKU', 'Qty (No.)', 'Date', 'Invoice Number_dispatch', 'Invoice Amount_dispatch', 'Quantity (Kg)', 'Product (SKU)', 'No of Packets']
+    # Build the final dataframe with proper column selection
+    final_df = pd.DataFrame()
+    final_df['PO UID'] = merged_df['PO UID']
     
-    # We need to ensure these columns exist. 
-    # 'Invoice Number' exists in both? 
-    # Let's check the source columns from the notebook logic or previous viewing.
-    # dispatch_orders: 'Invoice Number', 'Invoice Amount'
-    # fulltracker_orders: 'Invoice Number', 'Invoice Amount'
-    # So suffixes will apply to these.
+    # Full Tracker columns
+    final_df['Fulltracker Dispatch Date'] = merged_df.get('Dispatch Date', pd.NA)
+    final_df['Fulltracker Invoice Number'] = merged_df.get('Invoice Number_fulltracker', pd.NA)
+    final_df['Fulltracker Invoice Amount'] = merged_df.get('Invoice Amount_fulltracker', pd.NA)
+    final_df['Fulltracker Total Qty (Kg)'] = merged_df.get('Total Qty (Kg)', pd.NA)
+    final_df['Fulltracker SKU'] = merged_df.get('SKU', pd.NA)
+    final_df['Fulltracker Packets Qty'] = merged_df.get('Qty (No.)', pd.NA)
     
-    # Select requested columns
-    all_target_columns = [
-        'PO UID', 
-        'Dispatch Date', 
-        'Invoice Number_fulltracker', 
-        'Invoice Amount_fulltracker', 
-        'Total Qty (Kg)', 
-        'SKU', 
-        'Qty (No.)', 
-        'Date', 
-        'Invoice Number_dispatch', 
-        'Invoice Amount_dispatch', 
-        'Quantity (Kg)', 
-        'Product (SKU)', 
-        'No of Packets'
-    ]
-    
-    # Ensure columns exist (fill with NaN if missing due to outer join or naming mismatch)
-    for col in all_target_columns:
-        if col not in merged_df.columns:
-            merged_df[col] = pd.NA
-            
-    final_df = merged_df[all_target_columns]
-    
-    # Rename Columns
-    rename_map = {
-        'Dispatch Date': 'Fulltracker Dispatch Date',
-        'Invoice Number_fulltracker': 'Fulltracker Invoice Number',
-        'Invoice Amount_fulltracker': 'Fulltracker Invoice Amount',
-        'Total Qty (Kg)': 'Fulltracker Total Qty (Kg)',
-        'SKU': 'Fulltracker SKU',
-        'Qty (No.)': 'Fulltracker Packets Qty',
-        'Date': 'Dispatch Date',
-        'Invoice Number_dispatch': 'Dispatch Invoice Number',
-        'Invoice Amount_dispatch': 'Dispatch Invoice Amount',
-        'Quantity (Kg)': 'Dispatch Total Qty (Kg)',
-        'Product (SKU)': 'Dispatch SKU',
-        'No of Packets': 'Dispatch Packets Qty'
-    }
-    
-    final_df = final_df.rename(columns=rename_map)
+    # Dispatch columns
+    final_df['Dispatch Date'] = merged_df.get('Date', pd.NA)
+    final_df['Dispatch Invoice Number'] = merged_df.get('Invoice Number_dispatch', pd.NA)
+    final_df['Dispatch Invoice Amount'] = merged_df.get('Invoice Amount_dispatch', pd.NA)
+    final_df['Dispatch Total Qty (Kg)'] = merged_df.get('Quantity (Kg)', pd.NA)
+    final_df['Dispatch SKU'] = merged_df.get('Product (SKU)', pd.NA)
+    final_df['Dispatch Packets Qty'] = merged_df.get('No of Packets', pd.NA)
     
     # Convert numeric columns to float to ensure proper formatting
+    # Note: Packets Qty columns can contain comma-separated values for multi-SKU orders, so keep them as strings
     numeric_columns = ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount', 
-                       'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)',
-                       'Fulltracker Packets Qty', 'Dispatch Packets Qty']
+                       'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)']
     
     for col in numeric_columns:
         if col in final_df.columns:
@@ -524,13 +491,13 @@ elif app_mode == "Dispatch vs Full Tracker":
     
     st.write("Select columns to display:")
     
-    # Update default options to use renamed columns
-    renamed_options = [rename_map.get(col, col) for col in all_target_columns]
+    # Get all columns from final_df
+    available_columns = final_df.columns.tolist()
     
     selected_columns = st.multiselect(
         "Columns", 
-        renamed_options, 
-        default=renamed_options
+        available_columns, 
+        default=available_columns
     )
     
     if selected_columns:
@@ -579,20 +546,38 @@ elif app_mode == "Dispatch vs Full Tracker":
             if 'Fulltracker SKU' in cols and 'Dispatch SKU' in cols:
                 ft_sku = row['Fulltracker SKU']
                 d_sku = row['Dispatch SKU']
-                if pd.isna(ft_sku) or pd.isna(d_sku) or ft_sku != d_sku:
+                if pd.isna(ft_sku) or pd.isna(d_sku):
                     colors[cols.index('Fulltracker SKU')] = 'color: #ff0000'
                     colors[cols.index('Dispatch SKU')] = 'color: #ff0000'
+                else:
+                    # For SKU comparison, split by comma/newline and compare as sets (order doesn't matter)
+                    # This handles both single SKUs and comma-separated multiple SKUs
+                    ft_sku_set = set(s.strip() for s in str(ft_sku).replace('\n', ',').split(',') if s.strip())
+                    d_sku_set = set(s.strip() for s in str(d_sku).replace('\n', ',').split(',') if s.strip())
+                    if ft_sku_set != d_sku_set:
+                        colors[cols.index('Fulltracker SKU')] = 'color: #ff0000'
+                        colors[cols.index('Dispatch SKU')] = 'color: #ff0000'
             
             # Check Packets Qty mismatch
             if 'Fulltracker Packets Qty' in cols and 'Dispatch Packets Qty' in cols:
                 ft_pkt = row['Fulltracker Packets Qty']
                 d_pkt = row['Dispatch Packets Qty']
-                # Check for NaN first, then compare
+                # Check for NaN first
                 if pd.isna(ft_pkt) or pd.isna(d_pkt):
                     colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
                     colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
+                # For numeric values, compare numerically
                 elif isinstance(ft_pkt, (int, float)) and isinstance(d_pkt, (int, float)):
                     if abs(ft_pkt - d_pkt) > 0.01:
+                        colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
+                        colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
+                # For string values (multi-SKU), compare as multisets (order doesn't matter, but frequency does)
+                elif isinstance(ft_pkt, str) or isinstance(d_pkt, str):
+                    # Split by comma/newline and compare as multisets
+                    ft_qty_list = [s.strip() for s in str(ft_pkt).replace('\n', ',').split(',') if s.strip()]
+                    d_qty_list = [s.strip() for s in str(d_pkt).replace('\n', ',').split(',') if s.strip()]
+                    # Use Counter to compare frequency of each quantity (allows duplicates)
+                    if Counter(ft_qty_list) != Counter(d_qty_list):
                         colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
                         colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
             
