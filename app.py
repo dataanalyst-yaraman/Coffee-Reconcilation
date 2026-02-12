@@ -2,6 +2,11 @@ import streamlit as st
 import pandas as pd
 import datetime
 from collections import Counter
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import os
+import json
+from dotenv import load_dotenv
 
 # Page Config
 st.set_page_config(page_title="Inventory vs Production", layout="wide")
@@ -11,30 +16,71 @@ st.sidebar.header("Overview")
 if st.sidebar.button("Refresh Data", key="refresh_data_top"):
     st.cache_data.clear()
 
+# --- GSpread Authentication ---
+@st.cache_resource
+def get_gspread_client():
+    scope = ["https://www.googleapis.com/auth/spreadsheets.readonly", "https://www.googleapis.com/auth/drive"]
+    
+    # 1. Check if we are running on Streamlit Cloud
+    try:
+        if "gcp_service_account" in st.secrets:
+            # Streamlit Cloud provides secrets as a dictionary automatically
+            creds_dict = st.secrets["gcp_service_account"]
+        else:
+            creds_dict = None
+    except Exception:
+        # st.secrets access fails if no secrets.toml exists (local dev)
+        creds_dict = None
+
+    if creds_dict is None:
+        # Fallback for local development
+        load_dotenv()
+        creds_json_str = os.getenv("GOOGLE_CREDENTIALS_DICT")
+        if not creds_json_str:
+            st.error("Google Credentials not found in environment variables (GOOGLE_CREDENTIALS_DICT).")
+            st.stop()
+        creds_dict = json.loads(creds_json_str)
+
+    credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(credentials)
+    return client
+
+client = get_gspread_client()
+
 app_mode = st.sidebar.radio("Go to", ["Inventory vs Production", "Dispatch vs Full Tracker"])
 
 if app_mode == "Inventory vs Production":
     st.title("Inventory vs Production Reconciliation")
-    
+
+
     # --- Data Loading ---
     @st.cache_data
     def load_inv_prod_data():
         # Inventory Sheet
-        sheet_id_inv = "1JTeE3dwYJj6cXGFF-MUWsmyX3aD3sHwh4dBR0KEgMVQ"
-        gid_inv = "2013262881"
-        url_inv = f"https://docs.google.com/spreadsheets/d/{sheet_id_inv}/export?format=csv&gid={gid_inv}"
-        inventory = pd.read_csv(url_inv)
+        try:
+            sh_inv = client.open_by_key("1JTeE3dwYJj6cXGFF-MUWsmyX3aD3sHwh4dBR0KEgMVQ")
+            inventory = pd.DataFrame(sh_inv.worksheet("Coffees").get_all_records())
+        except Exception as e:
+            st.error(f"Error loading 'Nandanvan Inventory': {e}")
+            return pd.DataFrame(), pd.DataFrame() # Return empty to handle gracefully
         
         # Production Sheet
-        sheet_id_prod = "1C8nwOXF1u944Km_5DcG34ntvmuWx9JBPhdyvsZT2bC8"
-        gid_prod = "0"
-        url_prod = f"https://docs.google.com/spreadsheets/d/{sheet_id_prod}/export?format=csv&gid={gid_prod}"
-        production = pd.read_csv(url_prod)
-        
+        try:
+            sh_prod = client.open_by_key("1C8nwOXF1u944Km_5DcG34ntvmuWx9JBPhdyvsZT2bC8")
+            production = pd.DataFrame(sh_prod.worksheet("Coffee").get_all_records())
+        except Exception as e:
+            st.error(f"Error loading 'Nandanvan Production': {e}")
+            return inventory, pd.DataFrame()
+
         return inventory, production
+        
+
 
     try:
         inventory_df, production_df = load_inv_prod_data()
+        if inventory_df.empty or production_df.empty:
+            st.error("Data could not be loaded. Please check the logs/errors above.")
+            st.stop()
     except Exception as e:
         st.error(f"Error loading data: {e}")
         st.stop()
@@ -365,32 +411,35 @@ elif app_mode == "Dispatch vs Full Tracker":
     # --- Data Loading ---
     @st.cache_data
     def load_dispatch_data():
+        client = get_gspread_client()
+        
         # Dispatch Orders
-        sheet_id_dispatch = "1RfXzquQLqPWh8neSDhbNkQfR2vLJlM0gutRTlZK8Jbg"
-        gid_dispatch = "958246669"
-        url_dispatch = f"https://docs.google.com/spreadsheets/d/{sheet_id_dispatch}/export?format=csv&gid={gid_dispatch}"
-        dispatch_orders = pd.read_csv(url_dispatch)
-        
-        # Dispatch Items (for SKU totals)
-        gid_dispatch_items = "1450158975"
-        url_dispatch_items = f"https://docs.google.com/spreadsheets/d/{sheet_id_dispatch}/export?format=csv&gid={gid_dispatch_items}"
-        dispatch_items = pd.read_csv(url_dispatch_items)
-        
+        try:
+            sh_dispatch = client.open_by_key("1RfXzquQLqPWh8neSDhbNkQfR2vLJlM0gutRTlZK8Jbg")
+            dispatch_orders = pd.DataFrame(sh_dispatch.worksheet("Orders").get_all_records())
+            dispatch_items = pd.DataFrame(sh_dispatch.worksheet("Items").get_all_records())
+        except Exception as e:
+           st.error(f"Error loading 'Nandanvan Dispatch': {e}")
+           dispatch_orders = pd.DataFrame()
+           dispatch_items = pd.DataFrame()
+
         # Full Tracker Orders
-        sheet_id_full = "1wrAHd2f7GcEtrtEpiV4TYYsI81f5tbQtUrzGIjAX55o"
-        gid_full = "1113783161"
-        url_full = f"https://docs.google.com/spreadsheets/d/{sheet_id_full}/export?format=csv&gid={gid_full}"
-        fulltracker_orders = pd.read_csv(url_full)
-        
-        # Full Tracker Items (for SKU totals)
-        gid_full_items = "712686230"
-        url_full_items = f"https://docs.google.com/spreadsheets/d/{sheet_id_full}/export?format=csv&gid={gid_full_items}"
-        fulltracker_items = pd.read_csv(url_full_items)
+        try:
+            sh_full = client.open_by_key("1wrAHd2f7GcEtrtEpiV4TYYsI81f5tbQtUrzGIjAX55o")
+            fulltracker_orders = pd.DataFrame(sh_full.worksheet("Orders").get_all_records())
+            fulltracker_items = pd.DataFrame(sh_full.worksheet("Items").get_all_records())
+        except Exception as e:
+            st.error(f"Error loading 'Full Tracking': {e}")
+            fulltracker_orders = pd.DataFrame()
+            fulltracker_items = pd.DataFrame()
         
         return dispatch_orders, dispatch_items, fulltracker_orders, fulltracker_items
 
     try:
         dispatch_orders, dispatch_items, fulltracker_orders, fulltracker_items = load_dispatch_data()
+        if dispatch_orders.empty or fulltracker_orders.empty:
+            st.error("Data could not be loaded. Please ensure 'Nandanvan Dispatch' and 'Full Tracking' sheets are shared with the service account and contain 'Orders' and 'Items' worksheets.")
+            st.stop()
     except Exception as e:
         st.error(f"Error loading data: {e}")
         st.stop()
@@ -612,8 +661,13 @@ elif app_mode == "Dispatch vs Full Tracker":
     disp_pouids = dispatch_orders_filtered['PO UID'].unique()
     
     # 2. Filter Items tables
-    ft_items_filtered = fulltracker_items[fulltracker_items['PO UID'].isin(ft_pouids)]
-    disp_items_filtered = dispatch_items[dispatch_items['PO UID'].isin(disp_pouids)]
+    if not fulltracker_items.empty and not dispatch_items.empty:
+        ft_items_filtered = fulltracker_items[fulltracker_items['PO UID'].isin(ft_pouids)]
+        disp_items_filtered = dispatch_items[dispatch_items['PO UID'].isin(disp_pouids)]
+    else:
+        st.warning("Items data not available. Skipping SKU Totals Variance.")
+        ft_items_filtered = pd.DataFrame(columns=['SKU', 'Quantity', 'Total Kg'])
+        disp_items_filtered = pd.DataFrame(columns=['SKU', 'Quantity', 'Total Kg'])
     
     # 3. Group by SKU and Agg
     fulltracker_items_total_sku = ft_items_filtered.groupby(['SKU']).agg({'Quantity': 'sum', 'Total Kg': 'sum'}).reset_index()
