@@ -47,7 +47,7 @@ def get_gspread_client():
 
 client = get_gspread_client()
 
-app_mode = st.sidebar.radio("Go to", ["Inventory vs Production", "Dispatch vs Full Tracker"])
+app_mode = st.sidebar.radio("Go to", ["Inventory vs Production", "Dispatch vs Full Tracker", "Packets and Packing Materials"])
 
 if app_mode == "Inventory vs Production":
     st.title("Inventory vs Production Reconciliation")
@@ -765,3 +765,185 @@ elif app_mode == "Dispatch vs Full Tracker":
         .format({"Total Invoice Amount": "{:.2f}"}),
         use_container_width=True
     )
+
+elif app_mode == "Packets and Packing Materials":
+    st.title("Packets and Packing Materials Inventory")
+
+    # --- Data Loading ---
+    @st.cache_data
+    def load_packed_materials_data():
+        client = get_gspread_client()
+        try:
+            sh_inv = client.open_by_key("1JTeE3dwYJj6cXGFF-MUWsmyX3aD3sHwh4dBR0KEgMVQ")
+            packets_worksheet = sh_inv.worksheet("Packets")
+            pm_worksheet = sh_inv.worksheet("Packing Materials")
+            
+            packets_data = packets_worksheet.get_all_records()
+            pm_data = pm_worksheet.get_all_records()
+            
+            packets_df = pd.DataFrame(packets_data)
+            packing_materials_df = pd.DataFrame(pm_data)
+            
+        except Exception as e:
+            st.error(f"Error loading data: {e}")
+            return pd.DataFrame(), pd.DataFrame()
+        
+        return packets_df, packing_materials_df
+
+    try:
+        packets_df, packing_materials_df = load_packed_materials_data()
+        
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        st.stop()
+
+    # --- Preprocessing ---
+    # Convert dates
+    if not packets_df.empty and 'Date' in packets_df.columns:
+        packets_df['Date'] = pd.to_datetime(packets_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
+    
+    if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
+        packing_materials_df['Date'] = pd.to_datetime(packing_materials_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
+
+    # --- Sidebar Filters ---
+    st.sidebar.markdown("<br>" * 2, unsafe_allow_html=True)
+    st.sidebar.header("Packets and Packing Materials Filters")
+    
+    # Get Date Range
+    all_dates = pd.Series(dtype='object')
+    if not packets_df.empty and 'Date' in packets_df.columns:
+        all_dates = pd.concat([all_dates, packets_df['Date']])
+    if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
+        all_dates = pd.concat([all_dates, packing_materials_df['Date']])
+        
+    all_dates = all_dates.dropna()
+    
+    if not all_dates.empty:
+        min_date = all_dates.min()
+        max_date = all_dates.max()
+    else:
+        min_date = datetime.date.today()
+        max_date = datetime.date.today()
+
+    start_date = st.sidebar.date_input("Start Date", min_date, key="pm_start_date")
+    end_date = st.sidebar.date_input("End Date", max_date, key="pm_end_date")
+
+    # Filter Data
+    if not packets_df.empty and 'Date' in packets_df.columns:
+        packets_filtered = packets_df[(packets_df['Date'] >= start_date) & (packets_df['Date'] <= end_date)]
+    else:
+        packets_filtered = pd.DataFrame()
+        
+    if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
+        pm_filtered = packing_materials_df[(packing_materials_df['Date'] >= start_date) & (packing_materials_df['Date'] <= end_date)]
+    else: 
+        pm_filtered = pd.DataFrame()
+
+    # --- Tabs ---
+    tab1, tab2 = st.tabs(["Packets", "Packing Materials"])
+
+    # --- Tab 1: Packets ---
+    with tab1:
+        st.header("Packets: Stock In vs Stock Out")
+        
+        if not packets_filtered.empty:
+            # Ensure 'Quantity' is numeric
+            packets_filtered['Quantity'] = pd.to_numeric(packets_filtered['Quantity'], errors='coerce').fillna(0)
+            
+            # Pivot table to show Stock In vs Stock Out per SKU
+            # Group by Packet SKU and Packet Name
+            packets_pivot = packets_filtered.pivot_table(
+                index=['Packet SKU', 'Packet Name'], 
+                columns='Transaction Type', 
+                values='Quantity', 
+                aggfunc='sum', 
+                fill_value=0
+            ).reset_index()
+            
+            # Ensure columns exist
+            for col in ['Stock In', 'Stock Out']:
+                if col not in packets_pivot.columns:
+                    packets_pivot[col] = 0.0
+            
+            # Fill NaN with 0
+            packets_pivot = packets_pivot.fillna(0)
+
+            # Calculate Balance
+            packets_pivot['Balance'] = packets_pivot['Stock In'] - packets_pivot['Stock Out']
+
+            # Filter by Packet Name
+            unique_packets = sorted(packets_pivot['Packet Name'].unique())
+            selected_packets = st.multiselect("Select Packets", unique_packets, default=unique_packets)
+            
+            if selected_packets:
+                packets_pivot = packets_pivot[packets_pivot['Packet Name'].isin(selected_packets)]
+
+            # Reorder columns
+            cols_order = ['Packet SKU', 'Packet Name', 'Stock In', 'Stock Out', 'Balance']
+            # Add any other columns that might exist (e.g. Adjustment)
+            remaining_cols = [c for c in packets_pivot.columns if c not in cols_order]
+            final_cols = cols_order + remaining_cols
+            
+            st.dataframe(packets_pivot[final_cols].style.format({
+                "Stock In": "{:.2f}", 
+                "Stock Out": "{:.2f}",
+                "Balance": "{:.2f}"
+            }), use_container_width=True)
+            
+        else:
+            st.info("No Packets data for selected date range.")
+
+    # --- Tab 2: Packing Materials ---
+    with tab2:
+        st.header("Packing Materials: Category Wise Stock In vs Stock Out")
+        
+        if not pm_filtered.empty:
+            # Ensure 'Quantity' is numeric
+            pm_filtered['Quantity'] = pd.to_numeric(pm_filtered['Quantity'], errors='coerce').fillna(0)
+            
+            # Pivot table
+            # Group by Category and Name
+            pm_pivot = pm_filtered.pivot_table(
+                index=['Packing Materials Category', 'Packing Material Name'], 
+                columns='Transaction Type', 
+                values='Quantity', 
+                aggfunc='sum', 
+                fill_value=0
+            ).reset_index()
+            
+            # Ensure columns exist
+            for col in ['Stock In', 'Stock Out']:
+                if col not in pm_pivot.columns:
+                    pm_pivot[col] = 0.0
+            
+            # Fill NaN with 0
+            pm_pivot = pm_pivot.fillna(0)
+            
+            # Calculate Balance
+            pm_pivot['Balance'] = pm_pivot['Stock In'] - pm_pivot['Stock Out']
+
+            # Filter by Packing Material Name
+            unique_pm = sorted(pm_pivot['Packing Material Name'].unique())
+            selected_pm = st.multiselect("Select Packing Materials", unique_pm, default=unique_pm)
+            
+            if selected_pm:
+                pm_pivot = pm_pivot[pm_pivot['Packing Material Name'].isin(selected_pm)]
+            
+            # Sort by Category
+            pm_pivot = pm_pivot.sort_values(by=['Packing Materials Category', 'Packing Material Name'])
+
+            # Reorder columns
+            cols_order = ['Packing Materials Category', 'Packing Material Name', 'Stock In', 'Stock Out', 'Balance']
+            remaining_cols = [c for c in pm_pivot.columns if c not in cols_order]
+            final_cols = cols_order + remaining_cols
+
+            # Display
+            st.dataframe(pm_pivot[final_cols].style.format({
+                "Stock In": "{:.2f}", 
+                "Stock Out": "{:.2f}",
+                "Balance": "{:.2f}"
+            }), use_container_width=True)
+            
+        else:
+            st.info("No Packing Materials data for selected date range.")
+    
