@@ -780,6 +780,62 @@ elif app_mode == "Dispatch vs Full Tracker":
         use_container_width=True
     )
 
+    # --- Quantity and Packets Totals Validation (From Items Sheet) ---
+    st.divider()
+    st.subheader("Quantity and Packets Totals Variance")
+
+    # Calculate totals from the filtered ITEMS dataframes (created in SKU Totals section)
+    # Full Tracker Items
+    if not ft_items_filtered.empty:
+        ft_total_qty = pd.to_numeric(ft_items_filtered['Total Kg'], errors='coerce').fillna(0).sum()
+        ft_total_packets = pd.to_numeric(ft_items_filtered['Quantity'], errors='coerce').fillna(0).sum()
+    else:
+        ft_total_qty = 0.0
+        ft_total_packets = 0.0
+
+    # Dispatch Items
+    if not disp_items_filtered.empty:
+        disp_total_qty = pd.to_numeric(disp_items_filtered['Total Kg'], errors='coerce').fillna(0).sum()
+        disp_total_packets = pd.to_numeric(disp_items_filtered['Quantity'], errors='coerce').fillna(0).sum()
+    else:
+        disp_total_qty = 0.0
+        disp_total_packets = 0.0
+
+    qty_variance = abs(ft_total_qty - disp_total_qty)
+    packets_variance = abs(ft_total_packets - disp_total_packets)
+
+    # Create comparison dataframe
+    qty_comparison = pd.DataFrame({
+        'Source': ['FullTracker', 'Dispatch', 'Variance'],
+        'Total Quantity (Kg)': [ft_total_qty, disp_total_qty, qty_variance],
+        'Total Packets': [ft_total_packets, disp_total_packets, packets_variance]
+    })
+    
+    # Apply red text if there's a variance
+    def highlight_qty_variance(row):
+        colors = [''] * len(row)
+        
+        # Check Quantity Variance
+        if row['Source'] == 'Variance' and row['Total Quantity (Kg)'] > 0.01:
+            colors[1] = 'color: #ff0000'
+        elif row['Source'] in ['FullTracker', 'Dispatch'] and qty_variance > 0.01:
+            colors[1] = 'color: #ff0000'
+            
+        # Check Packets Variance
+        if row['Source'] == 'Variance' and row['Total Packets'] > 0.01:
+            colors[2] = 'color: #ff0000'
+        elif row['Source'] in ['FullTracker', 'Dispatch'] and packets_variance > 0.01:
+            colors[2] = 'color: #ff0000'
+            
+        return colors
+    
+    st.dataframe(
+        qty_comparison.style
+        .apply(highlight_qty_variance, axis=1)
+        .format({"Total Quantity (Kg)": "{:.2f}", "Total Packets": "{:.2f}"}),
+        use_container_width=True
+    )
+
 elif app_mode == "Packets and Packing Materials":
     st.title("Packets and Packing Materials Inventory")
 
