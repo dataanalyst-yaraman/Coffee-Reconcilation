@@ -36,10 +36,15 @@ def get_gspread_client():
         # Fallback for local development
         load_dotenv()
         creds_json_str = os.getenv("GOOGLE_CREDENTIALS_DICT")
-        if not creds_json_str:
-            st.error("Google Credentials not found in environment variables (GOOGLE_CREDENTIALS_DICT).")
+        if creds_json_str:
+            creds_dict = json.loads(creds_json_str)
+        elif os.path.exists("credentials.json"):
+            # Fallback to credentials.json file
+            with open("credentials.json") as f:
+                creds_dict = json.load(f)
+        else:
+            st.error("Google Credentials not found. Please set GOOGLE_CREDENTIALS_DICT in .env or provide credentials.json in the root directory.")
             st.stop()
-        creds_dict = json.loads(creds_json_str)
 
     credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(credentials)
@@ -97,6 +102,15 @@ if app_mode == "Inventory vs Production":
     if inventory_df.empty or production_df.empty:
         st.error("Data is empty after date parsing. Please check the date format in the sheets.")
         st.stop()
+
+    # Convert numeric columns to numeric types
+    for col in ['Quantity']:
+        if col in inventory_df.columns:
+            inventory_df[col] = pd.to_numeric(inventory_df[col], errors='coerce')
+
+    for col in ['Raw Coffee Taken', 'Roasted Output After SortOut (kg)', 'Lilmore Output (kg)']:
+        if col in production_df.columns:
+            production_df[col] = pd.to_numeric(production_df[col], errors='coerce')
 
     # Create "is L'Lmore" column in inventory
     inventory_df["is L'Lmore"] = inventory_df['Beans'].str.contains("L'Lmore", na=False)
@@ -850,15 +864,22 @@ elif app_mode == "Packets and Packing Materials":
             # Ensure 'Quantity' is numeric
             packets_filtered['Quantity'] = pd.to_numeric(packets_filtered['Quantity'], errors='coerce').fillna(0)
             
-            # Pivot table to show Stock In vs Stock Out per SKU
-            # Group by Packet SKU and Packet Name
-            packets_pivot = packets_filtered.pivot_table(
-                index=['Packet SKU', 'Packet Name'], 
-                columns='Transaction Type', 
-                values='Quantity', 
-                aggfunc='sum', 
-                fill_value=0
-            ).reset_index()
+            try:
+                # Pivot table to show Stock In vs Stock Out per SKU
+                # Group by Packet SKU and Packet Name
+                packets_pivot = packets_filtered.pivot_table(
+                    index=['Packet SKU', 'Packet Name'], 
+                    columns='Transaction Type', 
+                    values='Quantity', 
+                    aggfunc='sum', 
+                    fill_value=0
+                ).reset_index()
+            except KeyError as e:
+                st.error(f"Missing required columns for pivoting: {e}")
+                packets_pivot = pd.DataFrame(columns=['Packet SKU', 'Packet Name', 'Transaction Type', 'Quantity'])
+            except Exception as e:
+                st.error(f"Error processing Packets data: {e}")
+                packets_pivot = pd.DataFrame(columns=['Packet SKU', 'Packet Name', 'Transaction Type', 'Quantity'])
             
             # Ensure columns exist
             for col in ['Stock In', 'Stock Out']:
@@ -901,15 +922,22 @@ elif app_mode == "Packets and Packing Materials":
             # Ensure 'Quantity' is numeric
             pm_filtered['Quantity'] = pd.to_numeric(pm_filtered['Quantity'], errors='coerce').fillna(0)
             
-            # Pivot table
-            # Group by Category and Name
-            pm_pivot = pm_filtered.pivot_table(
-                index=['Packing Materials Category', 'Packing Material Name'], 
-                columns='Transaction Type', 
-                values='Quantity', 
-                aggfunc='sum', 
-                fill_value=0
-            ).reset_index()
+            try:
+                # Pivot table
+                # Group by Category and Name
+                pm_pivot = pm_filtered.pivot_table(
+                    index=['Packing Materials Category', 'Packing Material Name'], 
+                    columns='Transaction Type', 
+                    values='Quantity', 
+                    aggfunc='sum', 
+                    fill_value=0
+                ).reset_index()
+            except KeyError as e:
+                st.error(f"Missing required columns for pivoting: {e}")
+                pm_pivot = pd.DataFrame(columns=['Packing Materials Category', 'Packing Material Name', 'Transaction Type', 'Quantity'])
+            except Exception as e:
+                st.error(f"Error processing Packing Materials data: {e}")
+                pm_pivot = pd.DataFrame(columns=['Packing Materials Category', 'Packing Material Name', 'Transaction Type', 'Quantity'])
             
             # Ensure columns exist
             for col in ['Stock In', 'Stock Out']:
