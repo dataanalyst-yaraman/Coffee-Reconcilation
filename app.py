@@ -505,11 +505,12 @@ elif app_mode == "Dispatch vs Full Tracker":
         (dispatch_orders['Date'] <= end_date)
     ]
     
-    # Filter Full Tracker Orders by Date and PO UID 'YT'
+    # Filter Full Tracker Orders by Date, PO UID 'YT', and exclude Status 'Record Sales'
     fulltracker_orders_filtered = fulltracker_orders[
         (fulltracker_orders['Dispatch Date'] >= start_date) & 
         (fulltracker_orders['Dispatch Date'] <= end_date) &
-        (fulltracker_orders['PO UID'].str.startswith('YT', na=False))
+        (fulltracker_orders['PO UID'].str.startswith('YT', na=False)) &
+        (fulltracker_orders['Status'] != 'Record Sales')
     ]
     
     # Merge on PO UID (one row per order)
