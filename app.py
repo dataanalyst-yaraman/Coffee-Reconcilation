@@ -896,10 +896,17 @@ elif app_mode == "Packets and Packing Materials":
         min_date = datetime.date.today()
         max_date = datetime.date.today()
 
+    # Separate max dates for each dataset
+    packets_max_date = packets_df['Date'].dropna().max() if not packets_df.empty and 'Date' in packets_df.columns else max_date
+    pm_max_date = packing_materials_df['Date'].dropna().max() if not packing_materials_df.empty and 'Date' in packing_materials_df.columns else max_date
+
     start_date = st.sidebar.date_input("Start Date", min_date, key="pm_start_date")
     end_date = st.sidebar.date_input("End Date", max_date, key="pm_end_date")
 
-    # Filter Data
+    # Fixed balance start date: always Oct 31, 2025
+    balance_start_date = datetime.date(2025, 10, 31)
+
+    # Filter Data (user-selected date range for Stock In / Stock Out columns)
     if not packets_df.empty and 'Date' in packets_df.columns:
         packets_filtered = packets_df[(packets_df['Date'] >= start_date) & (packets_df['Date'] <= end_date)]
     else:
@@ -909,6 +916,17 @@ elif app_mode == "Packets and Packing Materials":
         pm_filtered = packing_materials_df[(packing_materials_df['Date'] >= start_date) & (packing_materials_df['Date'] <= end_date)]
     else: 
         pm_filtered = pd.DataFrame()
+
+    # Balance-filtered data: always from Oct 31 to user-selected end date (ignores start_date)
+    if not packets_df.empty and 'Date' in packets_df.columns:
+        packets_balance_filtered = packets_df[(packets_df['Date'] >= balance_start_date) & (packets_df['Date'] <= end_date)]
+    else:
+        packets_balance_filtered = pd.DataFrame()
+
+    if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
+        pm_balance_filtered = packing_materials_df[(packing_materials_df['Date'] >= balance_start_date) & (packing_materials_df['Date'] <= end_date)]
+    else:
+        pm_balance_filtered = pd.DataFrame()
 
     # --- Tabs ---
     tab1, tab2 = st.tabs(["Packets", "Packing Materials"])
@@ -946,8 +964,38 @@ elif app_mode == "Packets and Packing Materials":
             # Fill NaN with 0
             packets_pivot = packets_pivot.fillna(0)
 
-            # Calculate Balance
-            packets_pivot['Balance'] = packets_pivot['Stock In'] - packets_pivot['Stock Out']
+            # Calculate Balance from fixed start date (Oct 31, 2025) to end_date
+            if not packets_balance_filtered.empty:
+                packets_balance_filtered_copy = packets_balance_filtered.copy()
+                packets_balance_filtered_copy['Quantity'] = pd.to_numeric(packets_balance_filtered_copy['Quantity'], errors='coerce').fillna(0)
+                try:
+                    balance_pivot = packets_balance_filtered_copy.pivot_table(
+                        index=['Packet SKU', 'Packet Name'],
+                        columns='Transaction Type',
+                        values='Quantity',
+                        aggfunc='sum',
+                        fill_value=0
+                    ).reset_index()
+                    for col in ['Stock In', 'Stock Out']:
+                        if col not in balance_pivot.columns:
+                            balance_pivot[col] = 0.0
+                    balance_pivot['Balance'] = balance_pivot['Stock In'] - balance_pivot['Stock Out']
+                    # Merge balance into main pivot
+                    packets_pivot = packets_pivot.drop(columns=['Balance'], errors='ignore')
+                    packets_pivot = packets_pivot.merge(
+                        balance_pivot[['Packet SKU', 'Packet Name', 'Balance']],
+                        on=['Packet SKU', 'Packet Name'],
+                        how='left'
+                    ).fillna(0)
+                except Exception:
+                    packets_pivot['Balance'] = packets_pivot['Stock In'] - packets_pivot['Stock Out']
+            else:
+                packets_pivot['Balance'] = packets_pivot['Stock In'] - packets_pivot['Stock Out']
+
+            # Convert numeric columns to int
+            for col in ['Stock In', 'Stock Out', 'Balance']:
+                if col in packets_pivot.columns:
+                    packets_pivot[col] = packets_pivot[col].astype(int)
 
             # Filter by Packet Name
             unique_packets = sorted(packets_pivot['Packet Name'].unique())
@@ -962,11 +1010,8 @@ elif app_mode == "Packets and Packing Materials":
             remaining_cols = [c for c in packets_pivot.columns if c not in cols_order]
             final_cols = cols_order + remaining_cols
             
-            st.dataframe(packets_pivot[final_cols].style.format({
-                "Stock In": "{:.2f}", 
-                "Stock Out": "{:.2f}",
-                "Balance": "{:.2f}"
-            }), use_container_width=True)
+            st.caption(f"_Balance is calculated from **{balance_start_date.strftime('%d %b %Y')}** to **{end_date.strftime('%d %b %Y')}**_")
+            st.dataframe(packets_pivot[final_cols], use_container_width=True)
             
         else:
             st.info("No Packets data for selected date range.")
@@ -1004,8 +1049,37 @@ elif app_mode == "Packets and Packing Materials":
             # Fill NaN with 0
             pm_pivot = pm_pivot.fillna(0)
             
-            # Calculate Balance
-            pm_pivot['Balance'] = pm_pivot['Stock In'] - pm_pivot['Stock Out']
+            # Calculate Balance from fixed start date (Oct 31, 2025) to end_date
+            if not pm_balance_filtered.empty:
+                pm_balance_filtered_copy = pm_balance_filtered.copy()
+                pm_balance_filtered_copy['Quantity'] = pd.to_numeric(pm_balance_filtered_copy['Quantity'], errors='coerce').fillna(0)
+                try:
+                    pm_balance_pivot = pm_balance_filtered_copy.pivot_table(
+                        index=['Packing Materials Category', 'Packing Material Name'],
+                        columns='Transaction Type',
+                        values='Quantity',
+                        aggfunc='sum',
+                        fill_value=0
+                    ).reset_index()
+                    for col in ['Stock In', 'Stock Out']:
+                        if col not in pm_balance_pivot.columns:
+                            pm_balance_pivot[col] = 0.0
+                    pm_balance_pivot['Balance'] = pm_balance_pivot['Stock In'] - pm_balance_pivot['Stock Out']
+                    # Merge balance into main pivot
+                    pm_pivot = pm_pivot.merge(
+                        pm_balance_pivot[['Packing Materials Category', 'Packing Material Name', 'Balance']],
+                        on=['Packing Materials Category', 'Packing Material Name'],
+                        how='left'
+                    ).fillna(0)
+                except Exception:
+                    pm_pivot['Balance'] = pm_pivot['Stock In'] - pm_pivot['Stock Out']
+            else:
+                pm_pivot['Balance'] = pm_pivot['Stock In'] - pm_pivot['Stock Out']
+
+            # Convert numeric columns to int
+            for col in ['Stock In', 'Stock Out', 'Balance']:
+                if col in pm_pivot.columns:
+                    pm_pivot[col] = pm_pivot[col].astype(int)
 
             # Filter by Packing Material Name
             unique_pm = sorted(pm_pivot['Packing Material Name'].unique())
@@ -1023,11 +1097,101 @@ elif app_mode == "Packets and Packing Materials":
             final_cols = cols_order + remaining_cols
 
             # Display
-            st.dataframe(pm_pivot[final_cols].style.format({
-                "Stock In": "{:.2f}", 
-                "Stock Out": "{:.2f}",
-                "Balance": "{:.2f}"
-            }), use_container_width=True)
+            st.caption(f"_Balance is calculated from **{balance_start_date.strftime('%d %b %Y')}** to **{end_date.strftime('%d %b %Y')}**_")
+            st.dataframe(pm_pivot[final_cols], use_container_width=True)
+
+            # --- Average Monthly Consumption Table ---
+            st.divider()
+            st.header("Packing Materials: Average Monthly Consumption")
+            st.caption(f"_Based on Stock Out from **{start_date.strftime('%d %b %Y')}** to **{end_date.strftime('%d %b %Y')}**_")
+
+            # Filter Stock Out transactions in the selected date range
+            pm_stockout = pm_filtered[pm_filtered['Transaction Type'] == 'Stock Out'].copy()
+
+            if not pm_stockout.empty:
+                pm_stockout['Quantity'] = pd.to_numeric(pm_stockout['Quantity'], errors='coerce').fillna(0)
+
+                # Calculate number of months in the selected date range
+                num_days = (end_date - start_date).days
+                num_months = max(num_days / 30.44, 1)  # average days per month, minimum 1
+
+                # Group by Category and Name
+                monthly_consumption = pm_stockout.groupby(
+                    ['Packing Materials Category', 'Packing Material Name']
+                )['Quantity'].sum().reset_index()
+                monthly_consumption = monthly_consumption.rename(columns={'Quantity': 'Total Stock Out'})
+                monthly_consumption['Avg Monthly Consumption'] = (monthly_consumption['Total Stock Out'] / num_months).astype(int)
+                monthly_consumption['Total Stock Out'] = monthly_consumption['Total Stock Out'].astype(int)
+
+                # Apply selected packing material filter
+                if selected_pm:
+                    monthly_consumption = monthly_consumption[monthly_consumption['Packing Material Name'].isin(selected_pm)]
+
+                # Sort by Category
+                monthly_consumption = monthly_consumption.sort_values(by=['Packing Materials Category', 'Packing Material Name'])
+
+                st.dataframe(monthly_consumption, use_container_width=True)
+
+                st.caption(f"_Number of months in range: **{num_months:.1f}**_")
+            else:
+                st.info("No Stock Out data available for the selected date range to calculate average consumption.")
+
+            # --- Stock In Hand & Days Stock Will Last (STATIC - not affected by date filters) ---
+            st.divider()
+            st.header("Packing Materials: Stock In Hand & Days Stock Will Last")
+
+            # Use ALL data from Oct 31, 2025 to the latest available date (completely static)
+            pm_static_filtered = packing_materials_df[
+                (packing_materials_df['Date'] >= balance_start_date)
+            ].copy() if not packing_materials_df.empty and 'Date' in packing_materials_df.columns else pd.DataFrame()
+
+            if not pm_static_filtered.empty:
+                pm_static_filtered['Quantity'] = pd.to_numeric(pm_static_filtered['Quantity'], errors='coerce').fillna(0)
+                static_max_date = pm_max_date  # Use packing materials specific max date
+
+                try:
+                    static_pivot = pm_static_filtered.pivot_table(
+                        index=['Packing Materials Category', 'Packing Material Name'],
+                        columns='Transaction Type',
+                        values='Quantity',
+                        aggfunc='sum',
+                        fill_value=0
+                    ).reset_index()
+
+                    for col in ['Stock In', 'Stock Out']:
+                        if col not in static_pivot.columns:
+                            static_pivot[col] = 0
+
+                    static_pivot['Stock In Hand'] = static_pivot['Stock In'] - static_pivot['Stock Out']
+
+                    # Calculate Days Stock Will Last = (Stock In Hand / Avg Monthly Consumption) * 30
+                    static_num_days = max((static_max_date - balance_start_date).days, 1)
+                    static_num_months = max(static_num_days / 30.44, 1)
+                    static_pivot['Avg Monthly Consumption'] = (static_pivot['Stock Out'] / static_num_months)
+                    static_pivot['Days Stock Will Last'] = static_pivot.apply(
+                        lambda row: int((row['Stock In Hand'] / row['Avg Monthly Consumption']) * 30) if row['Avg Monthly Consumption'] > 0 else 0, axis=1
+                    )
+
+                    # Convert to int
+                    for col in ['Stock In Hand', 'Days Stock Will Last']:
+                        static_pivot[col] = static_pivot[col].astype(int)
+
+                    # Apply selected packing material filter
+                    if selected_pm:
+                        static_pivot = static_pivot[static_pivot['Packing Material Name'].isin(selected_pm)]
+
+                    # Sort
+                    static_pivot = static_pivot.sort_values(by=['Packing Materials Category', 'Packing Material Name'])
+
+                    static_cols = ['Packing Materials Category', 'Packing Material Name', 'Stock In Hand', 'Days Stock Will Last']
+
+                    st.caption(f"_Static data from **{balance_start_date.strftime('%d %b %Y')}** to **{static_max_date.strftime('%d %b %Y')}** · Not affected by date filters_")
+                    st.dataframe(static_pivot[static_cols], use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Error calculating Stock In Hand: {e}")
+            else:
+                st.info("No data available from Oct 31, 2025 onwards.")
             
         else:
             st.info("No Packing Materials data for selected date range.")
