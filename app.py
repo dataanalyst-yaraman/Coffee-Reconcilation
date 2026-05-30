@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import datetime
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
@@ -11,16 +12,140 @@ from dotenv import load_dotenv
 # Page Config
 st.set_page_config(page_title="Inventory vs Production", layout="wide")
 
-# --- Sidebar Navigation ---
+
+# ── Utility Functions ──────────────────────────────────────────────────────────
+
+def safe_to_numeric(series, strip_chars='₹,'):
+    """Convert a Series to numeric, stripping currency symbols and commas."""
+    cleaned = series.astype(str)
+    for ch in strip_chars:
+        cleaned = cleaned.str.replace(ch, '', regex=False)
+    return pd.to_numeric(cleaned.str.strip(), errors='coerce')
+
+
+def safe_to_date(series, fmt='%m/%d/%Y'):
+    """Convert a Series to Python date objects."""
+    return pd.to_datetime(series, format=fmt, errors='coerce').dt.date
+
+
+def highlight_mismatch(row):
+    """Highlight mismatched Inventory vs Production values in red."""
+    colors = [''] * len(row)
+    inv_val = row['Inventory']
+    prod_val = row['Production']
+
+    col_map = {col: idx for idx, col in enumerate(row.index)}
+    inv_idx = col_map['Inventory']
+    prod_idx = col_map['Production']
+
+    if pd.isna(inv_val) or pd.isna(prod_val):
+        colors[inv_idx] = 'color: #ff0000'
+        colors[prod_idx] = 'color: #ff0000'
+    elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
+        if abs(inv_val - prod_val) > 0.01:
+            colors[inv_idx] = 'color: #ff0000'
+            colors[prod_idx] = 'color: #ff0000'
+
+    return colors
+
+
+def render_inv_prod_tab(header, inv_filtered, prod_filtered, inv_filters,
+                        prod_column):
+    """
+    Render a reconciliation tab for Inventory vs Production.
+
+    Args:
+        header: Tab header text
+        inv_filtered: Date-filtered inventory DataFrame
+        prod_filtered: Date-filtered production DataFrame
+        inv_filters: Dict of {column: value} filters to apply to inventory
+        prod_column: Production column to compare against Inventory Quantity
+    """
+    st.header(header)
+
+    # Apply inventory filters
+    mask = pd.Series(True, index=inv_filtered.index)
+    for col, val in inv_filters.items():
+        mask &= (inv_filtered[col] == val)
+    inv_tab = inv_filtered.loc[mask]
+
+    prod_tab = prod_filtered.copy()
+
+    # Merge on Date + Label / Coffee Type
+    merged = inv_tab.merge(
+        prod_tab,
+        left_on=['Date', 'Label'],
+        right_on=['Date', 'Coffee Type'],
+        how='outer'
+    )[['Date', 'Label', 'Quantity', 'Coffee Type', prod_column]]
+
+    merged = merged.rename(columns={'Quantity': 'Inventory', prod_column: 'Production'})
+    merged = merged.round(2)
+
+    # Detailed Comparison
+    st.subheader("Detailed Comparison")
+    st.dataframe(
+        merged.style
+        .apply(highlight_mismatch, axis=1)
+        .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}),
+        use_container_width=True
+    )
+
+    # Totals side-by-side
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Inventory Total")
+        total_inv = inv_tab.groupby('Label')['Quantity'].sum().reset_index()
+        total_inv = total_inv.rename(columns={'Quantity': 'Inventory'})
+        st.dataframe(total_inv.style.format({"Inventory": "{:.2f}"}), use_container_width=True)
+
+    with col2:
+        st.subheader("Production Total")
+        total_prod = prod_tab.groupby('Coffee Type')[prod_column].sum().reset_index()
+        total_prod = total_prod.rename(columns={prod_column: 'Production'})
+        st.dataframe(total_prod.style.format({"Production": "{:.2f}"}), use_container_width=True)
+
+    # Variance
+    st.subheader("Variance")
+    validation = total_inv.merge(
+        total_prod,
+        left_on='Label',
+        right_on='Coffee Type',
+        how='outer'
+    ).fillna(0)
+
+    validation['Difference'] = (validation['Inventory'] - validation['Production']).abs()
+    validation = validation.round(2)
+
+    st.dataframe(
+        validation.style
+        .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}),
+        use_container_width=True
+    )
+
+
+def _check_required_columns(df, required_cols, sheet_name):
+    """Check that required columns exist in a DataFrame. Returns list of missing cols."""
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"'{sheet_name}' sheet is missing columns: {missing}")
+    return missing
+
+
+# ── Sidebar Navigation ────────────────────────────────────────────────────────
+
 st.sidebar.header("Overview")
 if st.sidebar.button("Refresh Data", key="refresh_data_top"):
     st.cache_data.clear()
 
-# --- GSpread Authentication ---
+
+# ── GSpread Authentication ─────────────────────────────────────────────────────
+
 @st.cache_resource
 def get_gspread_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets.readonly", "https://www.googleapis.com/auth/drive"]
-    
+
     # 1. Check if we are running on Streamlit Cloud
     try:
         if "gcp_service_account" in st.secrets:
@@ -54,32 +179,43 @@ client = get_gspread_client()
 
 app_mode = st.sidebar.radio("Go to", ["Inventory vs Production", "Dispatch vs Full Tracker", "Packets and Packing Materials"])
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE 1: Inventory vs Production
+# ══════════════════════════════════════════════════════════════════════════════
+
 if app_mode == "Inventory vs Production":
     st.title("Inventory vs Production Reconciliation")
 
-
-    # --- Data Loading ---
+    # --- Data Loading (parallel) ---
     @st.cache_data
     def load_inv_prod_data():
-        # Inventory Sheet
-        try:
-            sh_inv = client.open_by_key("1JTeE3dwYJj6cXGFF-MUWsmyX3aD3sHwh4dBR0KEgMVQ")
-            inventory = pd.DataFrame(sh_inv.worksheet("Coffees").get_all_records())
-        except Exception as e:
-            st.error(f"Error loading 'Nandanvan Inventory': {e}")
-            return pd.DataFrame(), pd.DataFrame() # Return empty to handle gracefully
-        
-        # Production Sheet
-        try:
-            sh_prod = client.open_by_key("1C8nwOXF1u944Km_5DcG34ntvmuWx9JBPhdyvsZT2bC8")
-            production = pd.DataFrame(sh_prod.worksheet("Coffee").get_all_records())
-        except Exception as e:
-            st.error(f"Error loading 'Nandanvan Production': {e}")
-            return inventory, pd.DataFrame()
+        def fetch_inventory():
+            sh = client.open_by_key("1JTeE3dwYJj6cXGFF-MUWsmyX3aD3sHwh4dBR0KEgMVQ")
+            return pd.DataFrame(sh.worksheet("Coffees").get_all_records())
+
+        def fetch_production():
+            sh = client.open_by_key("1C8nwOXF1u944Km_5DcG34ntvmuWx9JBPhdyvsZT2bC8")
+            return pd.DataFrame(sh.worksheet("Coffee").get_all_records())
+
+        inventory = pd.DataFrame()
+        production = pd.DataFrame()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            inv_future = executor.submit(fetch_inventory)
+            prod_future = executor.submit(fetch_production)
+
+            try:
+                inventory = inv_future.result()
+            except Exception as e:
+                st.error(f"Error loading 'Nandanvan Inventory': {e}")
+
+            try:
+                production = prod_future.result()
+            except Exception as e:
+                st.error(f"Error loading 'Nandanvan Production': {e}")
 
         return inventory, production
-        
-
 
     try:
         inventory_df, production_df = load_inv_prod_data()
@@ -90,10 +226,17 @@ if app_mode == "Inventory vs Production":
         st.error(f"Error loading data: {e}")
         st.stop()
 
+    # --- Column Guards ---
+    inv_required = ['Date', 'Quantity', 'Inventory Category', 'Transaction Type', 'Sold to Customer', 'Beans', 'Label']
+    prod_required = ['Date', 'Coffee Type', 'Raw Coffee Taken', 'Roasted Output After SortOut (kg)', 'Lilmore Output (kg)']
+
+    if _check_required_columns(inventory_df, inv_required, 'Inventory') or \
+       _check_required_columns(production_df, prod_required, 'Production'):
+        st.stop()
+
     # --- Preprocessing ---
-    # Convert dates
-    inventory_df['Date'] = pd.to_datetime(inventory_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
-    production_df['Date'] = pd.to_datetime(production_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
+    inventory_df['Date'] = safe_to_date(inventory_df['Date'])
+    production_df['Date'] = safe_to_date(production_df['Date'])
 
     # Drop rows with invalid dates
     inventory_df = inventory_df.dropna(subset=['Date'])
@@ -103,350 +246,118 @@ if app_mode == "Inventory vs Production":
         st.error("Data is empty after date parsing. Please check the date format in the sheets.")
         st.stop()
 
-    # Convert numeric columns to numeric types
-    for col in ['Quantity']:
-        if col in inventory_df.columns:
-            inventory_df[col] = pd.to_numeric(inventory_df[col], errors='coerce')
+    # Convert numeric columns
+    inventory_df['Quantity'] = safe_to_numeric(inventory_df['Quantity'])
 
     for col in ['Raw Coffee Taken', 'Roasted Output After SortOut (kg)', 'Lilmore Output (kg)']:
-        if col in production_df.columns:
-            production_df[col] = pd.to_numeric(production_df[col], errors='coerce')
+        production_df[col] = safe_to_numeric(production_df[col])
 
     # Create "is L'Lmore" column in inventory
     inventory_df["is L'Lmore"] = inventory_df['Beans'].str.contains("L'Lmore", na=False)
 
     # --- Sidebar Filters ---
     st.sidebar.header("Filters")
+    st.sidebar.markdown("<br>" * 10, unsafe_allow_html=True)  # Spacing for date picker
 
-    # Date Filter
-    st.sidebar.markdown("<br>" * 10, unsafe_allow_html=True) # Add significant spacing to prevent date picker cropping
-    min_date_inv = inventory_df['Date'].min()
-    max_date_inv = inventory_df['Date'].max()
-    min_date_prod = production_df['Date'].min()
-    max_date_prod = production_df['Date'].max()
+    min_date = min(inventory_df['Date'].min(), production_df['Date'].min())
+    max_date = max(inventory_df['Date'].max(), production_df['Date'].max())
 
-    min_date = min(min_date_inv, min_date_prod)
-    max_date = max(max_date_inv, max_date_prod)
-
-    # Ensure they are python date objects for streamlit
     if isinstance(min_date, pd.Timestamp): min_date = min_date.date()
     if isinstance(max_date, pd.Timestamp): max_date = max_date.date()
 
     start_date = st.sidebar.date_input("Start Date", min_date, key="inv_start_date")
     end_date = st.sidebar.date_input("End Date", max_date, key="inv_end_date")
 
-    # Filter Data by Date (both are date objects now)
-    inv_filtered = inventory_df[(inventory_df['Date'] >= start_date) & (inventory_df['Date'] <= end_date)]
-    prod_filtered = production_df[(production_df['Date'] >= start_date) & (production_df['Date'] <= end_date)]
+    # Filter by date
+    inv_filtered = inventory_df[(inventory_df['Date'] >= start_date) & (inventory_df['Date'] <= end_date)].copy()
+    prod_filtered = production_df[(production_df['Date'] >= start_date) & (production_df['Date'] <= end_date)].copy()
 
-    # --- Tabs ---
+    # --- Tabs (deduplicated via helper) ---
     tab1, tab2, tab3 = st.tabs(["Green Beans", "Roasted Beans", "Lilmore"])
 
-    # --- Tab 1: Green Beans vs Raw Coffee ---
     with tab1:
-        st.header("Green Beans Stock Out vs Raw Coffee Taken")
-        
-        # Logic from notebook:
-        # Inventory: Category='Green Beans', Sold to Customer='No', Transaction Type='Stock Out'
-        inv_gb = inv_filtered[
-            (inv_filtered['Inventory Category'] == 'Green Beans') & 
-            (inv_filtered["Sold to Customer"] == 'No') & 
-            (inv_filtered['Transaction Type'] == 'Stock Out')
-        ]
-        
-        # Production: Just the date filtered data
-        prod_gb = prod_filtered.copy()
-        
-        # Merge
-        # Note: Notebook merges on ['Date', 'Label'] (Inventory) and ['Date', 'Coffee Type'] (Production)
-        merged_gb = inv_gb.merge(
-            prod_gb, 
-            left_on=['Date', 'Label'], 
-            right_on=['Date', 'Coffee Type'], 
-            how='outer'
-        )[['Date', 'Label', 'Quantity', 'Coffee Type', 'Raw Coffee Taken']]
-        
-        # Rename columns and round
-        merged_gb = merged_gb.rename(columns={'Quantity': 'Inventory', 'Raw Coffee Taken': 'Production'})
-        merged_gb = merged_gb.round(2)
-        
-        # Display Merged Data
-        st.subheader("Detailed Comparison")
-        
-        # Apply red text to mismatched or null values
-        def highlight_detailed_mismatch(row):
-            colors = [''] * len(row)
-            inv_val = row['Inventory']
-            prod_val = row['Production']
-            
-            # Find column indices
-            inv_idx = row.index.get_loc('Inventory')
-            prod_idx = row.index.get_loc('Production')
-            
-            # Check if values don't match or if either is null
-            if pd.isna(inv_val) or pd.isna(prod_val):
-                colors[inv_idx] = 'color: #ff0000'
-                colors[prod_idx] = 'color: #ff0000'
-            elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
-                if abs(inv_val - prod_val) > 0.01:
-                    colors[inv_idx] = 'color: #ff0000'
-                    colors[prod_idx] = 'color: #ff0000'
-            
-            return colors
-        
-        st.dataframe(
-            merged_gb.style
-            .apply(highlight_detailed_mismatch, axis=1)
-            .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), 
-            use_container_width=True
-        )
-        
-        # Totals
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Inventory Total")
-            total_inv_gb = inv_gb.groupby('Label')['Quantity'].sum().reset_index()
-            total_inv_gb = total_inv_gb.rename(columns={'Quantity': 'Inventory'}) # Rounding handled by style
-            st.dataframe(total_inv_gb.style.format({"Inventory": "{:.2f}"}), use_container_width=True)
-            
-        with col2:
-            st.subheader("Production Total")
-            total_prod_gb = prod_gb.groupby('Coffee Type')['Raw Coffee Taken'].sum().reset_index()
-            total_prod_gb = total_prod_gb.rename(columns={'Raw Coffee Taken': 'Production'}) # Rounding handled by style
-            st.dataframe(total_prod_gb.style.format({"Production": "{:.2f}"}), use_container_width=True)
-
-        # Variance Check
-        st.subheader("Variance")
-        # Merge totals for comparison
-        validation_gb = total_inv_gb.merge(
-            total_prod_gb, 
-            left_on='Label', 
-            right_on='Coffee Type', 
-            how='outer'
-        ).fillna(0)
-        
-        validation_gb['Difference'] = (validation_gb['Inventory'] - validation_gb['Production']).abs()
-        validation_gb = validation_gb.round(2)
-        
-        st.dataframe(
-            validation_gb.style
-            .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}), 
-            use_container_width=True
+        render_inv_prod_tab(
+            header="Green Beans Stock Out vs Raw Coffee Taken",
+            inv_filtered=inv_filtered,
+            prod_filtered=prod_filtered,
+            inv_filters={
+                'Inventory Category': 'Green Beans',
+                'Sold to Customer': 'No',
+                'Transaction Type': 'Stock Out',
+            },
+            prod_column='Raw Coffee Taken',
         )
 
-
-    # --- Tab 2: Roasted Beans Stock vs Sort Out ---
     with tab2:
-        st.header("Roasted Beans Stock In vs Roasted Output After SortOut")
-        
-        # Logic from notebook:
-        # Inventory: Category='Roasted Beans', is L'Lmore=False, Transaction Type='Stock In'
-        inv_rb = inv_filtered[
-            (inv_filtered['Inventory Category'] == 'Roasted Beans') & 
-            (inv_filtered["is L'Lmore"] == False) & 
-            (inv_filtered['Transaction Type'] == 'Stock In')
-        ]
-        
-        # Production: Date filtered
-        prod_rb = prod_filtered.copy()
-        
-        # Merge
-        merged_rb = inv_rb.merge(
-            prod_rb, 
-            left_on=['Date', 'Label'], 
-            right_on=['Date', 'Coffee Type'], 
-            how='outer'
-        )[['Date', 'Label', 'Quantity', 'Coffee Type', 'Roasted Output After SortOut (kg)']]
-        
-        # Rename columns and round
-        merged_rb = merged_rb.rename(columns={'Quantity': 'Inventory', 'Roasted Output After SortOut (kg)': 'Production'})
-        merged_rb = merged_rb.round(2)
-        
-        # Display Merged Data
-        st.subheader("Detailed Comparison")
-        
-        # Apply red text to mismatched or null values
-        def highlight_detailed_mismatch(row):
-            colors = [''] * len(row)
-            inv_val = row['Inventory']
-            prod_val = row['Production']
-            
-            # Find column indices
-            inv_idx = row.index.get_loc('Inventory')
-            prod_idx = row.index.get_loc('Production')
-            
-            # Check if values don't match or if either is null
-            if pd.isna(inv_val) or pd.isna(prod_val):
-                colors[inv_idx] = 'color: #ff0000'
-                colors[prod_idx] = 'color: #ff0000'
-            elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
-                if abs(inv_val - prod_val) > 0.01:
-                    colors[inv_idx] = 'color: #ff0000'
-                    colors[prod_idx] = 'color: #ff0000'
-            
-            return colors
-        
-        st.dataframe(
-            merged_rb.style
-            .apply(highlight_detailed_mismatch, axis=1)
-            .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), 
-            use_container_width=True
-        )
-        
-        # Totals
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Inventory Total")
-            total_inv_rb = inv_rb.groupby('Label')['Quantity'].sum().reset_index()
-            total_inv_rb = total_inv_rb.rename(columns={'Quantity': 'Inventory'})
-            st.dataframe(total_inv_rb.style.format({"Inventory": "{:.2f}"}), use_container_width=True)
-            
-        with col2:
-            st.subheader("Production Total")
-            total_prod_rb = prod_rb.groupby('Coffee Type')['Roasted Output After SortOut (kg)'].sum().reset_index()
-            total_prod_rb = total_prod_rb.rename(columns={'Roasted Output After SortOut (kg)': 'Production'})
-            st.dataframe(total_prod_rb.style.format({"Production": "{:.2f}"}), use_container_width=True)
-            
-        # Variance Check
-        st.subheader("Variance")
-        validation_rb = total_inv_rb.merge(
-            total_prod_rb, 
-            left_on='Label', 
-            right_on='Coffee Type', 
-            how='outer'
-        ).fillna(0)
-        
-        validation_rb['Difference'] = (validation_rb['Inventory'] - validation_rb['Production']).abs()
-        validation_rb = validation_rb.round(2)
-        
-        st.dataframe(
-            validation_rb.style
-            .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}), 
-            use_container_width=True
+        render_inv_prod_tab(
+            header="Roasted Beans Stock In vs Roasted Output After SortOut",
+            inv_filtered=inv_filtered,
+            prod_filtered=prod_filtered,
+            inv_filters={
+                'Inventory Category': 'Roasted Beans',
+                "is L'Lmore": False,
+                'Transaction Type': 'Stock In',
+            },
+            prod_column='Roasted Output After SortOut (kg)',
         )
 
-
-    # --- Tab 3: Lilmore Output ---
     with tab3:
-        st.header("Lilmore Stock In vs Lilmore Output")
-        
-        # Logic from notebook:
-        # Inventory: Category='Roasted Beans', is L'Lmore=True, Transaction Type='Stock In'
-        inv_lm = inv_filtered[
-            (inv_filtered['Inventory Category'] == 'Roasted Beans') & 
-            (inv_filtered["is L'Lmore"] == True) & 
-            (inv_filtered['Transaction Type'] == 'Stock In')
-        ]
-        
-        # Production: Date filtered
-        prod_lm = prod_filtered.copy()
-        
-        # Merge
-        merged_lm = inv_lm.merge(
-            prod_lm, 
-            left_on=['Date', 'Label'], 
-            right_on=['Date', 'Coffee Type'], 
-            how='outer'
-        )[['Date', 'Label', 'Quantity', 'Coffee Type', 'Lilmore Output (kg)']]
-        
-        # Rename columns and round
-        merged_lm = merged_lm.rename(columns={'Quantity': 'Inventory', 'Lilmore Output (kg)': 'Production'})
-        merged_lm = merged_lm.round(2)
-        
-        # Display Merged Data
-        st.subheader("Detailed Comparison")
-        
-        # Apply red text to mismatched or null values
-        def highlight_detailed_mismatch(row):
-            colors = [''] * len(row)
-            inv_val = row['Inventory']
-            prod_val = row['Production']
-            
-            # Find column indices
-            inv_idx = row.index.get_loc('Inventory')
-            prod_idx = row.index.get_loc('Production')
-            
-            # Check if values don't match or if either is null
-            if pd.isna(inv_val) or pd.isna(prod_val):
-                colors[inv_idx] = 'color: #ff0000'
-                colors[prod_idx] = 'color: #ff0000'
-            elif isinstance(inv_val, (int, float)) and isinstance(prod_val, (int, float)):
-                if abs(inv_val - prod_val) > 0.01:
-                    colors[inv_idx] = 'color: #ff0000'
-                    colors[prod_idx] = 'color: #ff0000'
-            
-            return colors
-        
-        st.dataframe(
-            merged_lm.style
-            .apply(highlight_detailed_mismatch, axis=1)
-            .format({"Inventory": "{:.2f}", "Production": "{:.2f}"}), 
-            use_container_width=True
+        render_inv_prod_tab(
+            header="Lilmore Stock In vs Lilmore Output",
+            inv_filtered=inv_filtered,
+            prod_filtered=prod_filtered,
+            inv_filters={
+                'Inventory Category': 'Roasted Beans',
+                "is L'Lmore": True,
+                'Transaction Type': 'Stock In',
+            },
+            prod_column='Lilmore Output (kg)',
         )
-        
-        # Totals
-        col1, col2 = st.columns(2)
-        
-        with col1: 
-            st.subheader("Inventory Total")
-            total_inv_lm = inv_lm.groupby('Label')['Quantity'].sum().reset_index()
-            total_inv_lm = total_inv_lm.rename(columns={'Quantity': 'Inventory'})
-            st.dataframe(total_inv_lm.style.format({"Inventory": "{:.2f}"}), use_container_width=True)
-            
-        with col2:
-            st.subheader("Production Total")
-            total_prod_lm = prod_lm.groupby('Coffee Type')['Lilmore Output (kg)'].sum().reset_index()
-            total_prod_lm = total_prod_lm.rename(columns={'Lilmore Output (kg)': 'Production'})
-            st.dataframe(total_prod_lm.style.format({"Production": "{:.2f}"}), use_container_width=True)
 
-        # Variance Check
-        st.subheader("Variance")
-        validation_lm = total_inv_lm.merge(
-            total_prod_lm, 
-            left_on='Label', 
-            right_on='Coffee Type', 
-            how='outer'
-        ).fillna(0)
-        
-        validation_lm['Difference'] = (validation_lm['Inventory'] - validation_lm['Production']).abs()
-        validation_lm = validation_lm.round(2)
-        
-        st.dataframe(
-            validation_lm.style
-            .format({"Inventory": "{:.2f}", "Production": "{:.2f}", "Difference": "{:.2f}"}), 
-            use_container_width=True
-        )
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE 2: Dispatch vs Full Tracker
+# ══════════════════════════════════════════════════════════════════════════════
 
 elif app_mode == "Dispatch vs Full Tracker":
     st.title("Dispatch vs Full Tracker Reconciliation")
-    
-    # --- Data Loading ---
+
+    # --- Data Loading (parallel) ---
     @st.cache_data
     def load_dispatch_data():
         client = get_gspread_client()
-        
-        # Dispatch Orders
-        try:
-            sh_dispatch = client.open_by_key("1RfXzquQLqPWh8neSDhbNkQfR2vLJlM0gutRTlZK8Jbg")
-            dispatch_orders = pd.DataFrame(sh_dispatch.worksheet("Orders").get_all_records())
-            dispatch_items = pd.DataFrame(sh_dispatch.worksheet("Items").get_all_records())
-        except Exception as e:
-           st.error(f"Error loading 'Nandanvan Dispatch': {e}")
-           dispatch_orders = pd.DataFrame()
-           dispatch_items = pd.DataFrame()
 
-        # Full Tracker Orders
-        try:
-            sh_full = client.open_by_key("1wrAHd2f7GcEtrtEpiV4TYYsI81f5tbQtUrzGIjAX55o")
-            fulltracker_orders = pd.DataFrame(sh_full.worksheet("Orders").get_all_records())
-            fulltracker_items = pd.DataFrame(sh_full.worksheet("Items").get_all_records())
-        except Exception as e:
-            st.error(f"Error loading 'Full Tracking': {e}")
-            fulltracker_orders = pd.DataFrame()
-            fulltracker_items = pd.DataFrame()
-        
+        def fetch_dispatch():
+            sh = client.open_by_key("1RfXzquQLqPWh8neSDhbNkQfR2vLJlM0gutRTlZK8Jbg")
+            orders = pd.DataFrame(sh.worksheet("Orders").get_all_records())
+            items = pd.DataFrame(sh.worksheet("Items").get_all_records())
+            return orders, items
+
+        def fetch_fulltracker():
+            sh = client.open_by_key("1wrAHd2f7GcEtrtEpiV4TYYsI81f5tbQtUrzGIjAX55o")
+            orders = pd.DataFrame(sh.worksheet("Orders").get_all_records())
+            items = pd.DataFrame(sh.worksheet("Items").get_all_records())
+            return orders, items
+
+        dispatch_orders = pd.DataFrame()
+        dispatch_items = pd.DataFrame()
+        fulltracker_orders = pd.DataFrame()
+        fulltracker_items = pd.DataFrame()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            disp_future = executor.submit(fetch_dispatch)
+            ft_future = executor.submit(fetch_fulltracker)
+
+            try:
+                dispatch_orders, dispatch_items = disp_future.result()
+            except Exception as e:
+                st.error(f"Error loading 'Nandanvan Dispatch': {e}")
+
+            try:
+                fulltracker_orders, fulltracker_items = ft_future.result()
+            except Exception as e:
+                st.error(f"Error loading 'Full Tracking': {e}")
+
         return dispatch_orders, dispatch_items, fulltracker_orders, fulltracker_items
 
     try:
@@ -459,33 +370,23 @@ elif app_mode == "Dispatch vs Full Tracker":
         st.stop()
 
     # --- Preprocessing ---
-    # Convert dates
-    dispatch_orders['Date'] = pd.to_datetime(dispatch_orders['Date'], format='%m/%d/%Y', errors='coerce').dt.date
-    fulltracker_orders['Dispatch Date'] = pd.to_datetime(fulltracker_orders['Dispatch Date'], format='%m/%d/%Y', errors='coerce').dt.date
+    dispatch_orders['Date'] = safe_to_date(dispatch_orders['Date'])
+    fulltracker_orders['Dispatch Date'] = safe_to_date(fulltracker_orders['Dispatch Date'])
 
-    # Clean and convert Invoice Amount columns - remove rupee symbol and convert to float
+    # Clean Invoice Amount columns
     if 'Invoice Amount' in dispatch_orders.columns:
-        dispatch_orders['Invoice Amount'] = dispatch_orders['Invoice Amount'].astype(str).str.replace('₹', '').str.replace(',', '').str.strip()
-        dispatch_orders['Invoice Amount'] = pd.to_numeric(dispatch_orders['Invoice Amount'], errors='coerce').round(2)
-    
-    if 'Invoice Amount' in fulltracker_orders.columns:
-        fulltracker_orders['Invoice Amount'] = fulltracker_orders['Invoice Amount'].astype(str).str.replace('₹', '').str.replace(',', '').str.strip()
-        fulltracker_orders['Invoice Amount'] = pd.to_numeric(fulltracker_orders['Invoice Amount'], errors='coerce').round(2)
+        dispatch_orders['Invoice Amount'] = safe_to_numeric(dispatch_orders['Invoice Amount']).round(2)
 
-    # Drop rows with invalid dates in critical columns if necessary, or handle as NaT
-    # For now, we keep them but filtering might exclude them automatically
+    if 'Invoice Amount' in fulltracker_orders.columns:
+        fulltracker_orders['Invoice Amount'] = safe_to_numeric(fulltracker_orders['Invoice Amount']).round(2)
 
     # --- Sidebar Filters ---
     st.sidebar.header("Filters")
-    
-    # Use different keys for date inputs to avoid conflict with other view
     st.sidebar.markdown("<br>" * 10, unsafe_allow_html=True)
-    
-    # Calculate min/max dates
-    # Drop NaN values before min/max to avoid comparison errors
+
     dispatch_dates = dispatch_orders['Date'].dropna()
     fulltracker_dates = fulltracker_orders['Dispatch Date'].dropna()
-    
+
     min_date_disp = dispatch_dates.min() if len(dispatch_dates) > 0 else datetime.date.today()
     max_date_disp = dispatch_dates.max() if len(dispatch_dates) > 0 else datetime.date.today()
     min_date_ft = fulltracker_dates.min() if len(fulltracker_dates) > 0 else datetime.date.today()
@@ -496,35 +397,32 @@ elif app_mode == "Dispatch vs Full Tracker":
 
     start_date = st.sidebar.date_input("Start Date", min_date, key="disp_start_date")
     end_date = st.sidebar.date_input("End Date", max_date, key="disp_end_date")
-    
+
     # --- Filtering and Merging ---
-    
-    # Filter Dispatch Orders by Date
     dispatch_orders_filtered = dispatch_orders[
-        (dispatch_orders['Date'] >= start_date) & 
+        (dispatch_orders['Date'] >= start_date) &
         (dispatch_orders['Date'] <= end_date)
-    ]
-    
-    # Filter Full Tracker Orders by Date, PO UID 'YT', and exclude Status 'Record Sales'
+    ].copy()
+
     fulltracker_orders_filtered = fulltracker_orders[
-        (fulltracker_orders['Dispatch Date'] >= start_date) & 
+        (fulltracker_orders['Dispatch Date'] >= start_date) &
         (fulltracker_orders['Dispatch Date'] <= end_date) &
         (fulltracker_orders['PO UID'].str.startswith('YT', na=False)) &
         (fulltracker_orders['Status'] != 'Record Sales')
-    ]
-    
-    # Merge on PO UID (one row per order)
+    ].copy()
+
+    # Merge on PO UID
     merged_df = fulltracker_orders_filtered.merge(
-        dispatch_orders_filtered, 
-        on='PO UID', 
-        how='outer', 
+        dispatch_orders_filtered,
+        on='PO UID',
+        how='outer',
         suffixes=('_fulltracker', '_dispatch')
     )
-    
-    # Build the final dataframe with proper column selection
+
+    # Build final display dataframe
     final_df = pd.DataFrame()
     final_df['PO UID'] = merged_df['PO UID']
-    
+
     # Full Tracker columns
     final_df['Fulltracker Dispatch Date'] = merged_df.get('Dispatch Date', pd.NA)
     final_df['Fulltracker Invoice Number'] = merged_df.get('Invoice Number_fulltracker', pd.NA)
@@ -532,7 +430,7 @@ elif app_mode == "Dispatch vs Full Tracker":
     final_df['Fulltracker Total Qty (Kg)'] = merged_df.get('Total Qty (Kg)', pd.NA)
     final_df['Fulltracker SKU'] = merged_df.get('SKU', pd.NA)
     final_df['Fulltracker Packets Qty'] = merged_df.get('Qty (No.)', pd.NA)
-    
+
     # Dispatch columns
     final_df['Dispatch Date'] = merged_df.get('Date', pd.NA)
     final_df['Dispatch Invoice Number'] = merged_df.get('Invoice Number_dispatch', pd.NA)
@@ -540,127 +438,101 @@ elif app_mode == "Dispatch vs Full Tracker":
     final_df['Dispatch Total Qty (Kg)'] = merged_df.get('Quantity (Kg)', pd.NA)
     final_df['Dispatch SKU'] = merged_df.get('Product (SKU)', pd.NA)
     final_df['Dispatch Packets Qty'] = merged_df.get('No of Packets', pd.NA)
-    
-    # Convert numeric columns to float to ensure proper formatting
-    # Note: Packets Qty columns can contain comma-separated values for multi-SKU orders, so keep them as strings
-    numeric_columns = ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount', 
-                       'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)']
-    
-    for col in numeric_columns:
+
+    # Convert numeric columns (Packets Qty can be comma-separated strings, keep as-is)
+    for col in ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount',
+                'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)']:
         if col in final_df.columns:
             final_df[col] = pd.to_numeric(final_df[col], errors='coerce')
-    
+
     # --- Display ---
     st.subheader("Reconciliation Table")
-    
     st.write("Select columns to display:")
-    
-    # Get all columns from final_df
+
     available_columns = final_df.columns.tolist()
-    
-    selected_columns = st.multiselect(
-        "Columns", 
-        available_columns, 
-        default=available_columns
-    )
-    
+    selected_columns = st.multiselect("Columns", available_columns, default=available_columns)
+
     if selected_columns:
-        # Apply red text to mismatched values between FullTracker and Dispatch columns
+        # Optimised highlighting with pre-computed column index map
         def highlight_reconciliation_mismatch(row):
             colors = [''] * len(row)
-            
-            # Get column names that exist in the row
-            cols = row.index.tolist()
-            
-            # Check Invoice Number mismatch
-            if 'Fulltracker Invoice Number' in cols and 'Dispatch Invoice Number' in cols:
+            col_map = {col: idx for idx, col in enumerate(row.index)}
+
+            def mark_red(*col_names):
+                for c in col_names:
+                    if c in col_map:
+                        colors[col_map[c]] = 'color: #ff0000'
+
+            # Invoice Number
+            if 'Fulltracker Invoice Number' in col_map and 'Dispatch Invoice Number' in col_map:
                 ft_inv = row['Fulltracker Invoice Number']
                 d_inv = row['Dispatch Invoice Number']
                 if pd.isna(ft_inv) or pd.isna(d_inv) or ft_inv != d_inv:
-                    colors[cols.index('Fulltracker Invoice Number')] = 'color: #ff0000'
-                    colors[cols.index('Dispatch Invoice Number')] = 'color: #ff0000'
-            
-            # Check Invoice Amount mismatch
-            if 'Fulltracker Invoice Amount' in cols and 'Dispatch Invoice Amount' in cols:
+                    mark_red('Fulltracker Invoice Number', 'Dispatch Invoice Number')
+
+            # Invoice Amount
+            if 'Fulltracker Invoice Amount' in col_map and 'Dispatch Invoice Amount' in col_map:
                 ft_amt = row['Fulltracker Invoice Amount']
                 d_amt = row['Dispatch Invoice Amount']
-                # Check for NaN first, then compare
                 if pd.isna(ft_amt) or pd.isna(d_amt):
-                    colors[cols.index('Fulltracker Invoice Amount')] = 'color: #ff0000'
-                    colors[cols.index('Dispatch Invoice Amount')] = 'color: #ff0000'
+                    mark_red('Fulltracker Invoice Amount', 'Dispatch Invoice Amount')
                 elif isinstance(ft_amt, (int, float)) and isinstance(d_amt, (int, float)):
                     if abs(ft_amt - d_amt) > 0.01:
-                        colors[cols.index('Fulltracker Invoice Amount')] = 'color: #ff0000'
-                        colors[cols.index('Dispatch Invoice Amount')] = 'color: #ff0000'
-            
-            # Check Total Qty mismatch
-            if 'Fulltracker Total Qty (Kg)' in cols and 'Dispatch Total Qty (Kg)' in cols:
+                        mark_red('Fulltracker Invoice Amount', 'Dispatch Invoice Amount')
+
+            # Total Qty
+            if 'Fulltracker Total Qty (Kg)' in col_map and 'Dispatch Total Qty (Kg)' in col_map:
                 ft_qty = row['Fulltracker Total Qty (Kg)']
                 d_qty = row['Dispatch Total Qty (Kg)']
-                # Check for NaN first, then compare
                 if pd.isna(ft_qty) or pd.isna(d_qty):
-                    colors[cols.index('Fulltracker Total Qty (Kg)')] = 'color: #ff0000'
-                    colors[cols.index('Dispatch Total Qty (Kg)')] = 'color: #ff0000'
+                    mark_red('Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)')
                 elif isinstance(ft_qty, (int, float)) and isinstance(d_qty, (int, float)):
                     if abs(ft_qty - d_qty) > 0.01:
-                        colors[cols.index('Fulltracker Total Qty (Kg)')] = 'color: #ff0000'
-                        colors[cols.index('Dispatch Total Qty (Kg)')] = 'color: #ff0000'
-            
-            # Check SKU mismatch
-            if 'Fulltracker SKU' in cols and 'Dispatch SKU' in cols:
+                        mark_red('Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)')
+
+            # SKU
+            if 'Fulltracker SKU' in col_map and 'Dispatch SKU' in col_map:
                 ft_sku = row['Fulltracker SKU']
                 d_sku = row['Dispatch SKU']
                 if pd.isna(ft_sku) or pd.isna(d_sku):
-                    colors[cols.index('Fulltracker SKU')] = 'color: #ff0000'
-                    colors[cols.index('Dispatch SKU')] = 'color: #ff0000'
+                    mark_red('Fulltracker SKU', 'Dispatch SKU')
                 else:
-                    # For SKU comparison, split by comma/newline and compare as sets (order doesn't matter)
-                    # This handles both single SKUs and comma-separated multiple SKUs
                     ft_sku_set = set(s.strip() for s in str(ft_sku).replace('\n', ',').split(',') if s.strip())
                     d_sku_set = set(s.strip() for s in str(d_sku).replace('\n', ',').split(',') if s.strip())
                     if ft_sku_set != d_sku_set:
-                        colors[cols.index('Fulltracker SKU')] = 'color: #ff0000'
-                        colors[cols.index('Dispatch SKU')] = 'color: #ff0000'
-            
-            # Check Packets Qty mismatch
-            if 'Fulltracker Packets Qty' in cols and 'Dispatch Packets Qty' in cols:
+                        mark_red('Fulltracker SKU', 'Dispatch SKU')
+
+            # Packets Qty
+            if 'Fulltracker Packets Qty' in col_map and 'Dispatch Packets Qty' in col_map:
                 ft_pkt = row['Fulltracker Packets Qty']
                 d_pkt = row['Dispatch Packets Qty']
-                # Check for NaN first
                 if pd.isna(ft_pkt) or pd.isna(d_pkt):
-                    colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
-                    colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
-                # For numeric values, compare numerically
+                    mark_red('Fulltracker Packets Qty', 'Dispatch Packets Qty')
                 elif isinstance(ft_pkt, (int, float)) and isinstance(d_pkt, (int, float)):
                     if abs(ft_pkt - d_pkt) > 0.01:
-                        colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
-                        colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
-                # For string values (multi-SKU), compare as multisets (order doesn't matter, but frequency does)
+                        mark_red('Fulltracker Packets Qty', 'Dispatch Packets Qty')
                 elif isinstance(ft_pkt, str) or isinstance(d_pkt, str):
-                    # Split by comma/newline and compare as multisets
                     ft_qty_list = [s.strip() for s in str(ft_pkt).replace('\n', ',').split(',') if s.strip()]
                     d_qty_list = [s.strip() for s in str(d_pkt).replace('\n', ',').split(',') if s.strip()]
-                    # Use Counter to compare frequency of each quantity (allows duplicates)
                     if Counter(ft_qty_list) != Counter(d_qty_list):
-                        colors[cols.index('Fulltracker Packets Qty')] = 'color: #ff0000'
-                        colors[cols.index('Dispatch Packets Qty')] = 'color: #ff0000'
-            
+                        mark_red('Fulltracker Packets Qty', 'Dispatch Packets Qty')
+
             return colors
-        
-        # Create format dictionary for numeric columns that exist and are numeric
+
+        # Build format dict for numeric columns
         format_dict = {}
         for col in selected_columns:
-            if col in ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount', 
+            if col in ['Fulltracker Invoice Amount', 'Dispatch Invoice Amount',
                        'Fulltracker Total Qty (Kg)', 'Dispatch Total Qty (Kg)',
                        'Fulltracker Packets Qty', 'Dispatch Packets Qty']:
                 if col in final_df.columns and pd.api.types.is_numeric_dtype(final_df[col]):
                     format_dict[col] = '{:.2f}'
-        
+
         st.dataframe(
             final_df[selected_columns].style
             .apply(highlight_reconciliation_mismatch, axis=1)
             .format(format_dict, na_rep='')
-            .set_properties(**{'white-space': 'pre-wrap'}), 
+            .set_properties(**{'white-space': 'pre-wrap'}),
             use_container_width=True
         )
     else:
@@ -669,72 +541,76 @@ elif app_mode == "Dispatch vs Full Tracker":
     # --- SKU Totals Comparison ---
     st.divider()
     st.subheader("SKU Totals Variance")
-    
-    # 1. Get List of PO UIDs from the filtered orders
-    # We should filter items based on the filtered orders to ensure consistency
+
+    # Get PO UIDs from filtered orders
     ft_pouids = fulltracker_orders_filtered['PO UID'].unique()
     disp_pouids = dispatch_orders_filtered['PO UID'].unique()
-    
-    # 2. Filter Items tables
+
+    # Filter Items tables
     if not fulltracker_items.empty and not dispatch_items.empty:
-        ft_items_filtered = fulltracker_items[fulltracker_items['PO UID'].isin(ft_pouids)]
-        disp_items_filtered = dispatch_items[dispatch_items['PO UID'].isin(disp_pouids)]
+        ft_items_filtered = fulltracker_items[fulltracker_items['PO UID'].isin(ft_pouids)].copy()
+        disp_items_filtered = dispatch_items[dispatch_items['PO UID'].isin(disp_pouids)].copy()
+
+        # ── BUG FIX: Convert to numeric BEFORE aggregation ──
+        # Values arrive as strings from Google Sheets; without conversion
+        # .sum() concatenates strings instead of adding numbers.
+        for col in ['Quantity', 'Total Kg']:
+            if col in ft_items_filtered.columns:
+                ft_items_filtered[col] = safe_to_numeric(ft_items_filtered[col]).fillna(0)
+            if col in disp_items_filtered.columns:
+                disp_items_filtered[col] = safe_to_numeric(disp_items_filtered[col]).fillna(0)
     else:
         st.warning("Items data not available. Skipping SKU Totals Variance.")
         ft_items_filtered = pd.DataFrame(columns=['SKU', 'Quantity', 'Total Kg'])
         disp_items_filtered = pd.DataFrame(columns=['SKU', 'Quantity', 'Total Kg'])
-    
-    # 3. Group by SKU and Agg
-    fulltracker_items_total_sku = ft_items_filtered.groupby(['SKU']).agg({'Quantity': 'sum', 'Total Kg': 'sum'}).reset_index()
-    dispatch_items_total_sku = disp_items_filtered.groupby(['SKU']).agg({'Quantity': 'sum', 'Total Kg': 'sum'}).reset_index()
-    
-    # 4. Merge
+
+    # Group by SKU and aggregate
+    fulltracker_items_total_sku = ft_items_filtered.groupby(['SKU']).agg(
+        {'Quantity': 'sum', 'Total Kg': 'sum'}
+    ).reset_index()
+    dispatch_items_total_sku = disp_items_filtered.groupby(['SKU']).agg(
+        {'Quantity': 'sum', 'Total Kg': 'sum'}
+    ).reset_index()
+
+    # Merge
     sku_merge = fulltracker_items_total_sku.merge(
         dispatch_items_total_sku,
         on='SKU',
         how='outer',
         suffixes=('_FullTracker', '_Dispatch')
     ).fillna(0)
-    
-    # Rename columns for better readability
+
+    # Rename columns
     sku_merge = sku_merge.rename(columns={
         'Quantity_FullTracker': 'FullTracker Quantity',
         'Total Kg_FullTracker': 'FullTracker Total Kg',
         'Quantity_Dispatch': 'Dispatch Quantity',
         'Total Kg_Dispatch': 'Dispatch Total Kg'
     })
-    
-    # Convert to numeric to avoid string arithmetic errors
-    sku_merge['FullTracker Quantity'] = pd.to_numeric(sku_merge['FullTracker Quantity'], errors='coerce').fillna(0)
-    sku_merge['FullTracker Total Kg'] = pd.to_numeric(sku_merge['FullTracker Total Kg'], errors='coerce').fillna(0)
-    sku_merge['Dispatch Quantity'] = pd.to_numeric(sku_merge['Dispatch Quantity'], errors='coerce').fillna(0)
-    sku_merge['Dispatch Total Kg'] = pd.to_numeric(sku_merge['Dispatch Total Kg'], errors='coerce').fillna(0)
-    
-    # 5. Calculate Variance (Absolute)
+
+    # Ensure numeric (safety net after merge fillna)
+    for col in ['FullTracker Quantity', 'FullTracker Total Kg', 'Dispatch Quantity', 'Dispatch Total Kg']:
+        sku_merge[col] = pd.to_numeric(sku_merge[col], errors='coerce').fillna(0)
+
+    # Variance
     sku_merge['Quantity Variance'] = (sku_merge['FullTracker Quantity'] - sku_merge['Dispatch Quantity']).abs()
     sku_merge['Total Kg Variance'] = (sku_merge['FullTracker Total Kg'] - sku_merge['Dispatch Total Kg']).abs()
-    
-    # 6. Format and Display with red text for mismatches
+
+    # Highlight with optimised col_map
     def highlight_sku_mismatch(row):
         colors = [''] * len(row)
-        
-        # Get column indices
-        cols = row.index.tolist()
-        
-        # Highlight Quantity columns if variance > 0.01
+        col_map = {col: idx for idx, col in enumerate(row.index)}
+
         if row['Quantity Variance'] > 0.01:
-            colors[cols.index('FullTracker Quantity')] = 'color: #ff0000'
-            colors[cols.index('Dispatch Quantity')] = 'color: #ff0000'
-            colors[cols.index('Quantity Variance')] = 'color: #ff0000'
-        
-        # Highlight Total Kg columns if variance > 0.01
+            for c in ['FullTracker Quantity', 'Dispatch Quantity', 'Quantity Variance']:
+                colors[col_map[c]] = 'color: #ff0000'
+
         if row['Total Kg Variance'] > 0.01:
-            colors[cols.index('FullTracker Total Kg')] = 'color: #ff0000'
-            colors[cols.index('Dispatch Total Kg')] = 'color: #ff0000'
-            colors[cols.index('Total Kg Variance')] = 'color: #ff0000'
-        
+            for c in ['FullTracker Total Kg', 'Dispatch Total Kg', 'Total Kg Variance']:
+                colors[col_map[c]] = 'color: #ff0000'
+
         return colors
-    
+
     st.dataframe(
         sku_merge.style
         .apply(highlight_sku_mismatch, axis=1)
@@ -748,32 +624,28 @@ elif app_mode == "Dispatch vs Full Tracker":
         }),
         use_container_width=True
     )
-    
+
     # --- Invoice Amount Totals Validation ---
     st.divider()
     st.subheader("Invoice Amount Totals Variance")
-    
-    # Calculate total invoice amounts from filtered orders
-    # Convert to numeric first to avoid string concatenation errors
-    ft_total_invoice = pd.to_numeric(fulltracker_orders_filtered['Invoice Amount'], errors='coerce').fillna(0).sum()
-    disp_total_invoice = pd.to_numeric(dispatch_orders_filtered['Invoice Amount'], errors='coerce').fillna(0).sum()
+
+    ft_total_invoice = safe_to_numeric(fulltracker_orders_filtered['Invoice Amount']).fillna(0).sum()
+    disp_total_invoice = safe_to_numeric(dispatch_orders_filtered['Invoice Amount']).fillna(0).sum()
     invoice_variance = abs(ft_total_invoice - disp_total_invoice)
-    
-    # Create comparison dataframe
+
     invoice_comparison = pd.DataFrame({
         'Source': ['FullTracker', 'Dispatch', 'Variance'],
         'Total Invoice Amount': [ft_total_invoice, disp_total_invoice, invoice_variance]
     })
-    
-    # Apply red text if there's a variance
+
     def highlight_invoice_variance(row):
         colors = [''] * len(row)
         if row['Source'] == 'Variance' and row['Total Invoice Amount'] > 0.01:
-            colors[1] = 'color: #ff0000'  # Highlight the amount column
+            colors[1] = 'color: #ff0000'
         elif row['Source'] in ['FullTracker', 'Dispatch'] and invoice_variance > 0.01:
-            colors[1] = 'color: #ff0000'  # Highlight both source amounts if variance exists
+            colors[1] = 'color: #ff0000'
         return colors
-    
+
     st.dataframe(
         invoice_comparison.style
         .apply(highlight_invoice_variance, axis=1)
@@ -781,23 +653,20 @@ elif app_mode == "Dispatch vs Full Tracker":
         use_container_width=True
     )
 
-    # --- Quantity and Packets Totals Validation (From Items Sheet) ---
+    # --- Quantity and Packets Totals Validation ---
     st.divider()
     st.subheader("Quantity and Packets Totals Variance")
 
-    # Calculate totals from the filtered ITEMS dataframes (created in SKU Totals section)
-    # Full Tracker Items
     if not ft_items_filtered.empty:
-        ft_total_qty = pd.to_numeric(ft_items_filtered['Total Kg'], errors='coerce').fillna(0).sum()
-        ft_total_packets = pd.to_numeric(ft_items_filtered['Quantity'], errors='coerce').fillna(0).sum()
+        ft_total_qty = safe_to_numeric(ft_items_filtered['Total Kg']).fillna(0).sum()
+        ft_total_packets = safe_to_numeric(ft_items_filtered['Quantity']).fillna(0).sum()
     else:
         ft_total_qty = 0.0
         ft_total_packets = 0.0
 
-    # Dispatch Items
     if not disp_items_filtered.empty:
-        disp_total_qty = pd.to_numeric(disp_items_filtered['Total Kg'], errors='coerce').fillna(0).sum()
-        disp_total_packets = pd.to_numeric(disp_items_filtered['Quantity'], errors='coerce').fillna(0).sum()
+        disp_total_qty = safe_to_numeric(disp_items_filtered['Total Kg']).fillna(0).sum()
+        disp_total_packets = safe_to_numeric(disp_items_filtered['Quantity']).fillna(0).sum()
     else:
         disp_total_qty = 0.0
         disp_total_packets = 0.0
@@ -805,37 +674,38 @@ elif app_mode == "Dispatch vs Full Tracker":
     qty_variance = abs(ft_total_qty - disp_total_qty)
     packets_variance = abs(ft_total_packets - disp_total_packets)
 
-    # Create comparison dataframe
     qty_comparison = pd.DataFrame({
         'Source': ['FullTracker', 'Dispatch', 'Variance'],
         'Total Quantity (Kg)': [ft_total_qty, disp_total_qty, qty_variance],
         'Total Packets': [ft_total_packets, disp_total_packets, packets_variance]
     })
-    
-    # Apply red text if there's a variance
+
     def highlight_qty_variance(row):
         colors = [''] * len(row)
-        
-        # Check Quantity Variance
+
         if row['Source'] == 'Variance' and row['Total Quantity (Kg)'] > 0.01:
             colors[1] = 'color: #ff0000'
         elif row['Source'] in ['FullTracker', 'Dispatch'] and qty_variance > 0.01:
             colors[1] = 'color: #ff0000'
-            
-        # Check Packets Variance
+
         if row['Source'] == 'Variance' and row['Total Packets'] > 0.01:
             colors[2] = 'color: #ff0000'
         elif row['Source'] in ['FullTracker', 'Dispatch'] and packets_variance > 0.01:
             colors[2] = 'color: #ff0000'
-            
+
         return colors
-    
+
     st.dataframe(
         qty_comparison.style
         .apply(highlight_qty_variance, axis=1)
         .format({"Total Quantity (Kg)": "{:.2f}", "Total Packets": "{:.2f}"}),
         use_container_width=True
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODE 3: Packets and Packing Materials
+# ══════════════════════════════════════════════════════════════════════════════
 
 elif app_mode == "Packets and Packing Materials":
     st.title("Packets and Packing Materials Inventory")
@@ -846,49 +716,44 @@ elif app_mode == "Packets and Packing Materials":
         client = get_gspread_client()
         try:
             sh_inv = client.open_by_key("1JTeE3dwYJj6cXGFF-MUWsmyX3aD3sHwh4dBR0KEgMVQ")
-            packets_worksheet = sh_inv.worksheet("Packets")
-            pm_worksheet = sh_inv.worksheet("Packing Materials")
-            
-            packets_data = packets_worksheet.get_all_records()
-            pm_data = pm_worksheet.get_all_records()
-            
+            packets_data = sh_inv.worksheet("Packets").get_all_records()
+            pm_data = sh_inv.worksheet("Packing Materials").get_all_records()
+
             packets_df = pd.DataFrame(packets_data)
             packing_materials_df = pd.DataFrame(pm_data)
-            
+
         except Exception as e:
             st.error(f"Error loading data: {e}")
             return pd.DataFrame(), pd.DataFrame()
-        
+
         return packets_df, packing_materials_df
 
     try:
         packets_df, packing_materials_df = load_packed_materials_data()
-        
     except Exception as e:
         st.error(f"Error loading data: {e}")
         st.stop()
 
     # --- Preprocessing ---
-    # Convert dates
     if not packets_df.empty and 'Date' in packets_df.columns:
-        packets_df['Date'] = pd.to_datetime(packets_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
-    
+        packets_df['Date'] = safe_to_date(packets_df['Date'])
+
     if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
-        packing_materials_df['Date'] = pd.to_datetime(packing_materials_df['Date'], format='%m/%d/%Y', errors='coerce').dt.date
+        packing_materials_df['Date'] = safe_to_date(packing_materials_df['Date'])
 
     # --- Sidebar Filters ---
     st.sidebar.markdown("<br>" * 2, unsafe_allow_html=True)
     st.sidebar.header("Packets and Packing Materials Filters")
-    
+
     # Get Date Range
     all_dates = pd.Series(dtype='object')
     if not packets_df.empty and 'Date' in packets_df.columns:
         all_dates = pd.concat([all_dates, packets_df['Date']])
     if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
         all_dates = pd.concat([all_dates, packing_materials_df['Date']])
-        
+
     all_dates = all_dates.dropna()
-    
+
     if not all_dates.empty:
         min_date = all_dates.min()
         max_date = all_dates.max()
@@ -908,23 +773,23 @@ elif app_mode == "Packets and Packing Materials":
 
     # Filter Data (user-selected date range for Stock In / Stock Out columns)
     if not packets_df.empty and 'Date' in packets_df.columns:
-        packets_filtered = packets_df[(packets_df['Date'] >= start_date) & (packets_df['Date'] <= end_date)]
+        packets_filtered = packets_df[(packets_df['Date'] >= start_date) & (packets_df['Date'] <= end_date)].copy()
     else:
         packets_filtered = pd.DataFrame()
-        
+
     if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
-        pm_filtered = packing_materials_df[(packing_materials_df['Date'] >= start_date) & (packing_materials_df['Date'] <= end_date)]
-    else: 
+        pm_filtered = packing_materials_df[(packing_materials_df['Date'] >= start_date) & (packing_materials_df['Date'] <= end_date)].copy()
+    else:
         pm_filtered = pd.DataFrame()
 
     # Balance-filtered data: always from Oct 31 to user-selected end date (ignores start_date)
     if not packets_df.empty and 'Date' in packets_df.columns:
-        packets_balance_filtered = packets_df[(packets_df['Date'] >= balance_start_date) & (packets_df['Date'] <= end_date)]
+        packets_balance_filtered = packets_df[(packets_df['Date'] >= balance_start_date) & (packets_df['Date'] <= end_date)].copy()
     else:
         packets_balance_filtered = pd.DataFrame()
 
     if not packing_materials_df.empty and 'Date' in packing_materials_df.columns:
-        pm_balance_filtered = packing_materials_df[(packing_materials_df['Date'] >= balance_start_date) & (packing_materials_df['Date'] <= end_date)]
+        pm_balance_filtered = packing_materials_df[(packing_materials_df['Date'] >= balance_start_date) & (packing_materials_df['Date'] <= end_date)].copy()
     else:
         pm_balance_filtered = pd.DataFrame()
 
@@ -934,19 +799,16 @@ elif app_mode == "Packets and Packing Materials":
     # --- Tab 1: Packets ---
     with tab1:
         st.header("Packets: Stock In vs Stock Out")
-        
+
         if not packets_filtered.empty:
-            # Ensure 'Quantity' is numeric
-            packets_filtered['Quantity'] = pd.to_numeric(packets_filtered['Quantity'], errors='coerce').fillna(0)
-            
+            packets_filtered['Quantity'] = safe_to_numeric(packets_filtered['Quantity']).fillna(0)
+
             try:
-                # Pivot table to show Stock In vs Stock Out per SKU
-                # Group by Packet SKU and Packet Name
                 packets_pivot = packets_filtered.pivot_table(
-                    index=['Packet SKU', 'Packet Name'], 
-                    columns='Transaction Type', 
-                    values='Quantity', 
-                    aggfunc='sum', 
+                    index=['Packet SKU', 'Packet Name'],
+                    columns='Transaction Type',
+                    values='Quantity',
+                    aggfunc='sum',
                     fill_value=0
                 ).reset_index()
             except KeyError as e:
@@ -955,21 +817,19 @@ elif app_mode == "Packets and Packing Materials":
             except Exception as e:
                 st.error(f"Error processing Packets data: {e}")
                 packets_pivot = pd.DataFrame(columns=['Packet SKU', 'Packet Name', 'Transaction Type', 'Quantity'])
-            
-            # Ensure columns exist
+
             for col in ['Stock In', 'Stock Out']:
                 if col not in packets_pivot.columns:
                     packets_pivot[col] = 0.0
-            
-            # Fill NaN with 0
+
             packets_pivot = packets_pivot.fillna(0)
 
             # Calculate Balance from fixed start date (Oct 31, 2025) to end_date
             if not packets_balance_filtered.empty:
-                packets_balance_filtered_copy = packets_balance_filtered.copy()
-                packets_balance_filtered_copy['Quantity'] = pd.to_numeric(packets_balance_filtered_copy['Quantity'], errors='coerce').fillna(0)
+                packets_balance_copy = packets_balance_filtered.copy()
+                packets_balance_copy['Quantity'] = safe_to_numeric(packets_balance_copy['Quantity']).fillna(0)
                 try:
-                    balance_pivot = packets_balance_filtered_copy.pivot_table(
+                    balance_pivot = packets_balance_copy.pivot_table(
                         index=['Packet SKU', 'Packet Name'],
                         columns='Transaction Type',
                         values='Quantity',
@@ -1000,38 +860,34 @@ elif app_mode == "Packets and Packing Materials":
             # Filter by Packet Name
             unique_packets = sorted(packets_pivot['Packet Name'].unique())
             selected_packets = st.multiselect("Select Packets", unique_packets, default=unique_packets)
-            
+
             if selected_packets:
                 packets_pivot = packets_pivot[packets_pivot['Packet Name'].isin(selected_packets)]
 
             # Reorder columns
             cols_order = ['Packet SKU', 'Packet Name', 'Stock In', 'Stock Out', 'Balance']
-            # Add any other columns that might exist (e.g. Adjustment)
             remaining_cols = [c for c in packets_pivot.columns if c not in cols_order]
             final_cols = cols_order + remaining_cols
-            
+
             st.caption(f"_Balance is calculated from **{balance_start_date.strftime('%d %b %Y')}** to **{end_date.strftime('%d %b %Y')}**_")
             st.dataframe(packets_pivot[final_cols], use_container_width=True)
-            
+
         else:
             st.info("No Packets data for selected date range.")
 
     # --- Tab 2: Packing Materials ---
     with tab2:
         st.header("Packing Materials: Category Wise Stock In vs Stock Out")
-        
+
         if not pm_filtered.empty:
-            # Ensure 'Quantity' is numeric
-            pm_filtered['Quantity'] = pd.to_numeric(pm_filtered['Quantity'], errors='coerce').fillna(0)
-            
+            pm_filtered['Quantity'] = safe_to_numeric(pm_filtered['Quantity']).fillna(0)
+
             try:
-                # Pivot table
-                # Group by Category and Name
                 pm_pivot = pm_filtered.pivot_table(
-                    index=['Packing Materials Category', 'Packing Material Name'], 
-                    columns='Transaction Type', 
-                    values='Quantity', 
-                    aggfunc='sum', 
+                    index=['Packing Materials Category', 'Packing Material Name'],
+                    columns='Transaction Type',
+                    values='Quantity',
+                    aggfunc='sum',
                     fill_value=0
                 ).reset_index()
             except KeyError as e:
@@ -1040,21 +896,19 @@ elif app_mode == "Packets and Packing Materials":
             except Exception as e:
                 st.error(f"Error processing Packing Materials data: {e}")
                 pm_pivot = pd.DataFrame(columns=['Packing Materials Category', 'Packing Material Name', 'Transaction Type', 'Quantity'])
-            
-            # Ensure columns exist
+
             for col in ['Stock In', 'Stock Out']:
                 if col not in pm_pivot.columns:
                     pm_pivot[col] = 0.0
-            
-            # Fill NaN with 0
+
             pm_pivot = pm_pivot.fillna(0)
-            
+
             # Calculate Balance from fixed start date (Oct 31, 2025) to end_date
             if not pm_balance_filtered.empty:
-                pm_balance_filtered_copy = pm_balance_filtered.copy()
-                pm_balance_filtered_copy['Quantity'] = pd.to_numeric(pm_balance_filtered_copy['Quantity'], errors='coerce').fillna(0)
+                pm_balance_copy = pm_balance_filtered.copy()
+                pm_balance_copy['Quantity'] = safe_to_numeric(pm_balance_copy['Quantity']).fillna(0)
                 try:
-                    pm_balance_pivot = pm_balance_filtered_copy.pivot_table(
+                    pm_balance_pivot = pm_balance_copy.pivot_table(
                         index=['Packing Materials Category', 'Packing Material Name'],
                         columns='Transaction Type',
                         values='Quantity',
@@ -1084,10 +938,10 @@ elif app_mode == "Packets and Packing Materials":
             # Filter by Packing Material Name
             unique_pm = sorted(pm_pivot['Packing Material Name'].unique())
             selected_pm = st.multiselect("Select Packing Materials", unique_pm, default=unique_pm)
-            
+
             if selected_pm:
                 pm_pivot = pm_pivot[pm_pivot['Packing Material Name'].isin(selected_pm)]
-            
+
             # Sort by Category
             pm_pivot = pm_pivot.sort_values(by=['Packing Materials Category', 'Packing Material Name'])
 
@@ -1096,7 +950,6 @@ elif app_mode == "Packets and Packing Materials":
             remaining_cols = [c for c in pm_pivot.columns if c not in cols_order]
             final_cols = cols_order + remaining_cols
 
-            # Display
             st.caption(f"_Balance is calculated from **{balance_start_date.strftime('%d %b %Y')}** to **{end_date.strftime('%d %b %Y')}**_")
             st.dataframe(pm_pivot[final_cols], use_container_width=True)
 
@@ -1105,17 +958,14 @@ elif app_mode == "Packets and Packing Materials":
             st.header("Packing Materials: Average Monthly Consumption")
             st.caption(f"_Based on Stock Out from **{start_date.strftime('%d %b %Y')}** to **{end_date.strftime('%d %b %Y')}**_")
 
-            # Filter Stock Out transactions in the selected date range
             pm_stockout = pm_filtered[pm_filtered['Transaction Type'] == 'Stock Out'].copy()
 
             if not pm_stockout.empty:
-                pm_stockout['Quantity'] = pd.to_numeric(pm_stockout['Quantity'], errors='coerce').fillna(0)
+                pm_stockout['Quantity'] = safe_to_numeric(pm_stockout['Quantity']).fillna(0)
 
-                # Calculate number of months in the selected date range
                 num_days = (end_date - start_date).days
-                num_months = max(num_days / 30.44, 1)  # average days per month, minimum 1
+                num_months = max(num_days / 30.44, 1)
 
-                # Group by Category and Name
                 monthly_consumption = pm_stockout.groupby(
                     ['Packing Materials Category', 'Packing Material Name']
                 )['Quantity'].sum().reset_index()
@@ -1123,31 +973,27 @@ elif app_mode == "Packets and Packing Materials":
                 monthly_consumption['Avg Monthly Consumption'] = (monthly_consumption['Total Stock Out'] / num_months).astype(int)
                 monthly_consumption['Total Stock Out'] = monthly_consumption['Total Stock Out'].astype(int)
 
-                # Apply selected packing material filter
                 if selected_pm:
                     monthly_consumption = monthly_consumption[monthly_consumption['Packing Material Name'].isin(selected_pm)]
 
-                # Sort by Category
                 monthly_consumption = monthly_consumption.sort_values(by=['Packing Materials Category', 'Packing Material Name'])
 
                 st.dataframe(monthly_consumption, use_container_width=True)
-
                 st.caption(f"_Number of months in range: **{num_months:.1f}**_")
             else:
                 st.info("No Stock Out data available for the selected date range to calculate average consumption.")
 
-            # --- Stock In Hand & Days Stock Will Last (STATIC - not affected by date filters) ---
+            # --- Stock In Hand & Days Stock Will Last (STATIC) ---
             st.divider()
             st.header("Packing Materials: Stock In Hand & Days Stock Will Last")
 
-            # Use ALL data from Oct 31, 2025 to the latest available date (completely static)
             pm_static_filtered = packing_materials_df[
                 (packing_materials_df['Date'] >= balance_start_date)
             ].copy() if not packing_materials_df.empty and 'Date' in packing_materials_df.columns else pd.DataFrame()
 
             if not pm_static_filtered.empty:
-                pm_static_filtered['Quantity'] = pd.to_numeric(pm_static_filtered['Quantity'], errors='coerce').fillna(0)
-                static_max_date = pm_max_date  # Use packing materials specific max date
+                pm_static_filtered['Quantity'] = safe_to_numeric(pm_static_filtered['Quantity']).fillna(0)
+                static_max_date = pm_max_date
 
                 try:
                     static_pivot = pm_static_filtered.pivot_table(
@@ -1164,7 +1010,7 @@ elif app_mode == "Packets and Packing Materials":
 
                     static_pivot['Stock In Hand'] = static_pivot['Stock In'] - static_pivot['Stock Out']
 
-                    # Calculate Days Stock Will Last = (Stock In Hand / Avg Monthly Consumption) * 30
+                    # Days Stock Will Last = (Stock In Hand / Avg Monthly Consumption) * 30
                     static_num_days = max((static_max_date - balance_start_date).days, 1)
                     static_num_months = max(static_num_days / 30.44, 1)
                     static_pivot['Avg Monthly Consumption'] = (static_pivot['Stock Out'] / static_num_months)
@@ -1172,15 +1018,12 @@ elif app_mode == "Packets and Packing Materials":
                         lambda row: int((row['Stock In Hand'] / row['Avg Monthly Consumption']) * 30) if row['Avg Monthly Consumption'] > 0 else 0, axis=1
                     )
 
-                    # Convert to int
                     for col in ['Stock In Hand', 'Days Stock Will Last']:
                         static_pivot[col] = static_pivot[col].astype(int)
 
-                    # Apply selected packing material filter
                     if selected_pm:
                         static_pivot = static_pivot[static_pivot['Packing Material Name'].isin(selected_pm)]
 
-                    # Sort
                     static_pivot = static_pivot.sort_values(by=['Packing Materials Category', 'Packing Material Name'])
 
                     static_cols = ['Packing Materials Category', 'Packing Material Name', 'Stock In Hand', 'Days Stock Will Last']
@@ -1192,7 +1035,6 @@ elif app_mode == "Packets and Packing Materials":
                     st.error(f"Error calculating Stock In Hand: {e}")
             else:
                 st.info("No data available from Oct 31, 2025 onwards.")
-            
+
         else:
             st.info("No Packing Materials data for selected date range.")
-    
